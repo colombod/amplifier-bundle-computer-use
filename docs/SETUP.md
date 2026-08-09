@@ -10,7 +10,7 @@ that live outside this repository:
 | 1 | **Upstream module versions** — `loop-streaming`, `provider-anthropic` / `provider-openai` | Bundle refuses to mount, or silently degrades to a weaker function tool |
 | 2 | **A model that supports native computer use** | Provider reports no capability; the tool is dead weight |
 | 3 | **A target machine, and its per-platform prerequisites** — Windows **requires WSL2**; macOS requires **two** TCC grants; Linux requires **X11** (not Wayland) | Backend probe fails and tools never appear — or, on macOS and Linux, they appear and fail on first use |
-| 4 | **For remote targets: SSH, key auth, and `uv` on the far end** | Connect-time error, or a Phase-2 `BackendError` on an unimplemented action |
+| 4 | **For remote targets: SSH, key auth, and `uv` on the far end** | Connect-time error (missing `uv`, untrusted host key, no key-based auth) |
 
 Work through them in that order. Each section tells you the exact check to run. **But
 first, register the bundle at all** — none of the above matters until Amplifier knows
@@ -77,7 +77,7 @@ Stated plainly so you can pick a path you can actually finish.
 | macOS target — capture, `key`, `focus_window` | **Proven** on real hardware |
 | macOS target — `type_text` | **BROKEN. Known open defect.** Returns success, enters nothing. See [Known issues](#9-known-issues) |
 | Linux/X11 target (local) | Backend implemented; presence guard measured (`GUARD_MEASURED["linux-x11"] = True`) |
-| Remote target over SSH | Works for capture, move, click, `type_text`, `key`. **Nine actions are unimplemented Phase 2** — see [Remote action gaps](#remote-action-gaps) |
+| Remote target over SSH | Full action set is implemented and dispatched, including `left_mouse_down`/`up`, `left_click_drag`, `scroll`, `hold_key`, and all four `desktop` window/clipboard actions — see [Remote action coverage](#remote-action-coverage) |
 | Gemini | A dialect record exists in `providers.py` (`gemini-2.5-computer-use` → `computer_use`), built from captured traffic. **No live end-to-end run through this bundle is claimed.** |
 
 A whole-session, end-to-end run with the hook, native tool promotion, screenshot
@@ -381,19 +381,22 @@ non-login SSH shell's `PATH` does not contain `/mnt/c/...`. The absolute-path re
 in `windows.py` is load-bearing, not a wart. If you have a custom WSL mount root, set
 `powershell_path`.
 
-### Remote action gaps
+### Remote action coverage
 
-Nine actions raise `BackendError("... over the wire is Phase 2 - see design doc")` on a
-remote target. Verified in `remote_backend.py`:
+The full action set is implemented over the remote wire. Verified in
+`remote_backend.py`/`remote_agent.py` — every action below is a real entry in
+`RemoteAgent._HANDLERS` (`remote_agent.py:760`), not a client-side approximation:
 
 | Action | Remote |
 |---|---|
 | `screenshot` / `zoom`, `mouse_move`, clicks, `type`, `key`, `cursor_position`, monitor selection | Works |
-| `left_mouse_down`, `left_mouse_up`, `left_click_drag`, `scroll`, `hold_key` | **Phase 2 — not implemented** |
-| `desktop.list_windows`, `desktop.focus_window`, `desktop.get_clipboard`, `desktop.set_clipboard` | **Phase 2 — not implemented** |
+| `left_mouse_down`, `left_mouse_up`, `left_click_drag`, `scroll`, `hold_key` | Works |
+| `desktop.list_windows`, `desktop.focus_window`, `desktop.get_clipboard`, `desktop.set_clipboard` | Works |
 
-So: `desktop.focus_window` is a local-only capability today. On a remote target, focus the
-window with clicks and `key`, or drive the target locally.
+`left_mouse_down`/`left_mouse_up` are tracked in the remote agent's held-input ledger, so a
+link death between the two calls still releases the button. `left_click_drag` crosses the
+wire as one atomic `drag` call — never decomposed into mouse_down/move/mouse_up — so a link
+failure mid-drag cannot strand a held button either.
 
 ---
 
@@ -655,7 +658,6 @@ macOS is blocked. Windows and Linux `type` are unaffected.
 
 - No end-to-end whole-session run of all mechanisms together (`BACKLOG.md`).
 - Windows on-desktop indicator overlay is not built (Linux and macOS announce are).
-- Nine actions unimplemented over the remote wire — §5.
 - The held-input ledger has no release path if the agent process is `SIGKILL`ed or OOMs.
 
 ---
@@ -678,7 +680,6 @@ macOS is blocked. Windows and Linux `type` are unaffected.
 | `Tool computer failed: EOF when reading a line` | *(fixed)* Approval prompt with no TTY | Run interactively, or set `unattended_writes_ok: true` |
 | PowerShell banner text where JSON was expected | `bridge.ps1` missing from the deployed payload | Should not occur — it is in `PAYLOAD_MODULES`. File an issue |
 | `SESSION_LOCKED` / `this macOS session is LOCKED` | Target is locked | Unlock it. §8 |
-| `... over the wire is Phase 2` | Action not implemented for remote targets | §5. Drive that target locally, or use a different action |
 | `ToolVersionError` at mount | `model` / `tool_version` conflict, or an unverified model with no override | §2 |
 
 ### Trace

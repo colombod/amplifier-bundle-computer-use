@@ -137,11 +137,13 @@ monkey-patched on disk; nothing rots when the orchestrator changes.
 Focus a window before typing into it; use the clipboard to pull exact text out of an app;
 use `select_monitor` to switch which monitor the model sees, mid-session.
 
-> **On a remote (`ssh://`) target, nine of these are not implemented yet.**
-> `left_mouse_down`, `left_mouse_up`, `left_click_drag`, `scroll`, `hold_key`,
-> `desktop.list_windows`, `desktop.focus_window`, `desktop.get_clipboard`, and
-> `desktop.set_clipboard` all raise `BackendError("... over the wire is Phase 2")`.
-> See `docs/SETUP.md` §5.
+> **Every action above works against a remote (`ssh://`) target**, including
+> `left_mouse_down`/`left_mouse_up`, `left_click_drag`, `scroll`, `hold_key`, and
+> all four `desktop` window/clipboard actions. Each is a real entry in
+> `RemoteAgent._HANDLERS` (`remote_agent.py:760`); `left_click_drag` crosses the
+> wire as one atomic `drag` call rather than a decomposed
+> mouse_down/move/mouse_up sequence, so a link failure mid-drag cannot strand a
+> held button. See `docs/SETUP.md` §5.
 
 ## Coordinates
 
@@ -273,7 +275,6 @@ are created `0700` and files `0600`.
   the type path; hypothesis (unconfirmed) is that it posts to a specific app rather than
   the system-wide event tap. `key`-only flows on macOS are unaffected. Logged in
   `BACKLOG.md`.
-- **Nine actions are unimplemented over the remote wire** — see Tools above.
 - **No whole-session end-to-end run** of the hook, native promotion, screenshot rewriting
   and the write gate all executing together (`BACKLOG.md`).
 - **The Windows on-desktop indicator overlay is not built** (Linux and macOS announce are).
