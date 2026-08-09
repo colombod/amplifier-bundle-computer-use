@@ -392,6 +392,8 @@ After O1 there is no supported platform without an announcement channel, so this
 
 The opt-out governs *starting*. It does not, and cannot, override §6.0.
 
+**Defect fix, post-revision-2:** `coexistence.enabled: false` used to skip building the whole coexistence layer (halt, pause, target binding, exclusion, *and* disclosure) in one boolean, at `logger.info` - which made C1 acceptance item 6 false (a config key *could* disable the halt, by never building the guard that enforces it). Fixed: whenever a backend structurally supports presence detection, the guard is now built unconditionally - no config key of any kind can prevent that. `enabled` was not deleted; it was narrowed to an alias of `announce` (declining session-start *disclosure only*), and both keys are now gated the same way this section already gates a technically-failed channel: a real-time presence check refuses to *mount* (not merely to write, closing a related gap where a declined disclosure surfaced only as an ordinary-looking tool error on first use) when a human is already detected present, and proceeds loudly (never silently) when nobody is there. See `_disclosure_decline_reason`/`_refuse_if_disclosure_declined_with_human_present` in `__init__.py`.
+
 ---
 
 ## 8. Pause, cancel, and target binding
