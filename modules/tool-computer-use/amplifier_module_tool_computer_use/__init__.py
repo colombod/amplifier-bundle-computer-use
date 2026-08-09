@@ -72,7 +72,7 @@ from .presence import (
     PresenceState,
 )
 from .providers import dialect_for_tool_type, read_call
-from .registry import NoBackendAvailable, select_backend
+from .registry import _TARGET_MODEL, NoBackendAvailable, select_backend
 from .tool_versions import (
     beta_header_for,
     require_static_pairing,
@@ -1824,6 +1824,16 @@ class DesktopTool:
 
     @property
     def description(self) -> str:
+        # `desktop` is an ordinary tool (has its own input_schema) - unlike
+        # `computer`, it is never replaced by a provider's native server-side
+        # tool block, so this text is one of the few computer-use surfaces
+        # that reliably reaches the model on every dialect. That makes it the
+        # right place for facts that must not be lost to schema-stripping:
+        # the config.target shape fact (`_TARGET_MODEL`, shared verbatim with
+        # `registry._REMEDIATION`'s failure-path text - see that module) and
+        # the keystroke-interleaving safety note (moved here from the
+        # always-loaded awareness context to free its token budget; see
+        # `context/computer-use-awareness.md`).
         return (
             "Desktop helpers that complement the `computer` tool: list open windows, "
             "bring a window to the front before typing into it, read the display geometry, "
@@ -1837,7 +1847,11 @@ class DesktopTool:
             "This machine may be in use by a human at the same time as you: a window's "
             "focus or clipboard contents can change from something other than your own "
             "actions between calls, so re-check with `list_windows`/`get_clipboard` rather "
-            "than assuming the state you last set still holds."
+            "than assuming the state you last set still holds. Your keystrokes and theirs "
+            "can interleave rather than queue: a command you believe you typed verbatim may "
+            "land with extra or missing characters, so if a result looks off, verify what "
+            "actually landed before assuming your own input was wrong. Which machine this "
+            f"session controls is fixed for the whole session, not chosen per call: {_TARGET_MODEL}"
         )
 
     @property

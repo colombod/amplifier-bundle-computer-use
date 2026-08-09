@@ -1,16 +1,20 @@
 # Computer Use (real desktop control)
 
-This session can see and control a real desktop — Windows, macOS, or Linux, local or
-reachable over your private network — through the LLM provider's native computer-use
-tool, named `computer`. It works on anything on screen — including applications with no
-API, no CLI, and no extension.
+This session can see and control a real desktop — Windows, macOS, or Linux — through the
+LLM provider's native computer-use tool, named `computer`. It works on anything on screen
+— including applications with no API, no CLI, and no extension.
+
+**Which machine is fixed for the whole session**, resolved once at mount from
+`config.target`: unset means this machine; `ssh://user@host` means a different, reachable
+one over the network. There is deliberately no per-call host parameter — its absence is
+not evidence this capability is local-only. A user naming a different machine (by
+hostname, "my other computer", over Tailscale/VPN) is asking a `config.target` question,
+answerable only with a new session, not a limitation to report.
 
 **Delegate desktop work to `computer-use:computer-operator`.** It carries the operating
-rules for driving a live machine safely.
-
-Use it whenever the user asks what is on their screen, asks you to click, type, drag,
-scroll, or open something in a desktop application, or hits a task that cannot be done
-through an API.
+rules for driving a live machine safely. Use it whenever the user asks what is on their
+screen, asks you to click, type, drag, scroll, or open something in a desktop
+application, or hits a task that cannot be done through an API.
 
 **This capability is not always present.** If `computer_use_unavailable` appears in your
 tool list instead of `computer`/`desktop`, no backend was available for this session —
@@ -21,14 +25,7 @@ The screen is captured, downscaled, and handed to the model as an image; coordin
 model emits are scaled back to physical pixels automatically. Never guess coordinates —
 take a screenshot first.
 
-## You may not be the only one at this keyboard
-
-A human can be sitting at this machine typing at the same time you are driving it.
-Nothing separates the two input streams — your keystrokes and theirs interleave, not
-queue. A command you believe you typed verbatim can land with a stray character spliced
-in the middle of it, or with a character missing, and still look, from a screenshot, like
-the right window has focus. When a typed result looks even slightly off — an error you
-didn't expect, a typo you don't remember making, output that doesn't match what the
-command you sent should produce — suspect interleaving before you suspect your own
-reasoning. Verifying what actually landed is cheap; continuing on the assumption that it
-matched what you sent is not.
+**A human may share this keyboard, and keystrokes can interleave.** See the `desktop`
+tool's own description for the full safety note — moved there because it reaches the
+model on every dialect, unlike this always-loaded file, which competes with others for a
+fixed budget.

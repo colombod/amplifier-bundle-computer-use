@@ -22,6 +22,26 @@ from .windows import WindowsBackend
 logger = logging.getLogger(__name__)
 
 
+#: The shape fact about how a target machine is selected - the one thing a
+#: model resolving "is remote possible?" from schema silence cannot see on its
+#: own. Shared VERBATIM by two audiences so the fact never drifts between them:
+#: `_REMEDIATION` below (the failure path - an operator reads this only when
+#: mount() could not find a working backend) and `DesktopTool.description`
+#: (`__init__.py` - the success path, read by the model on every mounted
+#: session). Deliberately a shape claim, not an existence claim: asserting
+#: "remote is possible" contradicts a schema that shows no host parameter, and
+#: a model reconciling prose against schema trusts the schema. Explaining WHY
+#: the schema is silent - the target is resolved once, at mount, not per call -
+#: is the fact that actually closes the gap.
+_TARGET_MODEL = (
+    "set config.target='ssh://user@host' to point this capability at a "
+    "different, reachable machine instead. The target is bound ONCE, at "
+    "mount time - there is deliberately no per-call host parameter, and its "
+    "absence is not evidence this capability is local-only. Driving a "
+    "different machine means restarting with a new config.target, not a new "
+    "argument to an existing call."
+)
+
 #: Appended to `NoBackendAvailable`'s message - the "what to do next" a bare
 #: exception type name and a per-backend reason string do not supply on their
 #: own. `mount()` (`tool-computer-use/__init__.py`) logs this whole message via
@@ -36,8 +56,7 @@ _REMEDIATION = (
     "What to do: fix the backend that applies to this machine (see its reason "
     "above - e.g. a missing dependency, no DISPLAY/XAUTHORITY, powershell.exe "
     "unreachable, or a missing macOS Accessibility/Screen Recording grant), or "
-    "set config.target='ssh://user@host' to drive a different, reachable "
-    "machine instead. See docs/SETUP.md \u00a74 for per-platform backend "
+    f"{_TARGET_MODEL} See docs/SETUP.md \u00a74 for per-platform backend "
     "requirements."
 )
 
