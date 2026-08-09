@@ -91,23 +91,55 @@ class NoBackendAvailable(RuntimeError):
 
 
 #: `ssh://user@host` (or `ssh://host` - user optional, taken from the local
-#: SSH config/default in that case).
-_SSH_TARGET_RE = re.compile(r"^ssh://(?:(?P<user>[^@]+)@)?(?P<host>[^/]+)$")
+#: SSH config/default in that case), plus an OPTIONAL `:port` suffix
+#: (bug-hunt defect B: previously accepted here and then silently dropped -
+#: no `-p` ever reached `ssh`, see `ssh_transport.py`'s `_SSH_OPTS`).
+#:
+#: A bare (unbracketed) IPv6 literal is deliberately NOT matched by `host`
+#: (`[^/:\[\]]+` excludes `:`) - `ssh://user@::1` is genuinely ambiguous
+#: between "host `::1`, no port" and "host `:`, port `:1`"-shaped nonsense,
+#: so `_parse_target` raises rather than guessing. The bracketed form
+#: (`ssh://[::1]:2222`, mirroring RFC 3986's own authority syntax for a
+#: literal IPv6 address next to a port) is unambiguous and IS supported.
+_SSH_TARGET_RE = re.compile(
+    r"^ssh://"
+    r"(?:(?P<user>[^@/]+)@)?"
+    r"(?:\[(?P<v6host>[^\]]+)\]|(?P<host>[^:/\[\]]+))"
+    r"(?::(?P<port>\d+))?"
+    r"$"
+)
 
 
-def _parse_target(target: str) -> str:
-    """Return the `[user@]host` string `ssh` itself expects, or raise
-    `ValueError` for anything that isn't a well-formed `ssh://` target - a
-    malformed config value should fail loud with a clear parse error, not
-    silently be handed to `ssh` as a garbage argument."""
+def _parse_target(target: str) -> tuple[str, int | None]:
+    """Return the (`[user@]host`, `port`) pair `ssh` itself expects - `host`
+    is exactly the string `ssh`'s classic `[user@]hostname` destination
+    argument wants (no port embedded, bracket-free even for IPv6 - `ssh`
+    accepts a bare IPv6 literal there since there is no port suffix to
+    disambiguate it from); `port` is `None` for a standard/unconfigured
+    port, in which case callers must not pass `-p` at all (byte-identical
+    to this function's pre-port-support behavior).
+
+    Raises `ValueError` for anything that isn't a well-formed `ssh://`
+    target - a malformed config value should fail loud with a clear parse
+    error, not silently be handed to `ssh` as a garbage argument. This
+    includes a bare (unbracketed) IPv6 host - see `_SSH_TARGET_RE`'s own
+    comment for why that is rejected rather than guessed at.
+    """
     match = _SSH_TARGET_RE.match(target.strip())
     if not match:
         raise ValueError(
             f"config.target={target!r} is not a valid ssh:// target "
-            "(expected 'ssh://user@host' or 'ssh://host')"
+            "(expected 'ssh://user@host', 'ssh://host[:port]', or "
+            "'ssh://[ipv6-literal][:port]' - a bare, unbracketed IPv6 "
+            "literal is not accepted: it is ambiguous with a "
+            "'host:port' suffix, use 'ssh://[::1]:2222' instead)"
         )
-    user, host = match.group("user"), match.group("host")
-    return f"{user}@{host}" if user else host
+    user = match.group("user")
+    host = match.group("host") or match.group("v6host")
+    port_str = match.group("port")
+    port = int(port_str) if port_str else None
+    user_host = f"{user}@{host}" if user else host
+    return user_host, port
 
 
 #: Probe order. Windows-over-WSL2 first preserves today's default behavior; Linux X11
@@ -124,7 +156,9 @@ BACKEND_FACTORIES: tuple[type[Backend], ...] = (
 )
 
 
-def _build_ssh_transport(host: str, package_dir: Any, config: dict[str, Any]) -> Any:
+def _build_ssh_transport(
+    host: str, package_dir: Any, config: dict[str, Any], *, port: int | None = None
+) -> Any:
     """Return a per-target SHARED transport handle for a remote target.
 
     Singleton fix: this used to construct a brand-new `SshTransport` (hence a
@@ -162,9 +196,14 @@ def _build_ssh_transport(host: str, package_dir: Any, config: dict[str, Any]) ->
             deadman_seconds=float(config.get("deadman_seconds", 5.0)),
             read_only=bool(config.get("read_only", True)),
             with_pillow=bool(config.get("with_pillow", True)),
+            port=port,
         )
 
-    return acquire_shared_transport((ssh_path, host), _factory)
+    # `port` is part of the sharing key (bug-hunt defect B): two configured
+    # targets that differ ONLY by port (e.g. two agents on the same host,
+    # one on 22 and one on 2222) are genuinely different destinations and
+    # must never be folded into the same shared transport/agent process.
+    return acquire_shared_transport((ssh_path, host, port), _factory)
 
 
 def select_backend(
@@ -192,12 +231,14 @@ def select_backend(
 
         from .remote_backend import RemoteBackend
 
-        host = _parse_target(str(target))
+        host, port = _parse_target(str(target))
         package_dir = Path(__file__).parent
         backend = RemoteBackend(
             {
                 "_host": host,
-                "_transport": _build_ssh_transport(host, package_dir, config),
+                "_transport": _build_ssh_transport(
+                    host, package_dir, config, port=port
+                ),
             }
         )
         # M1 (docs/designs/capability-awareness.md \u00a74): this used to be a bare

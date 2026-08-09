@@ -73,7 +73,10 @@ logger = logging.getLogger(__name__)
 #: (ssh_path, host) -> _SharedEntry. Guarded exclusively by `_registry_lock` -
 #: every read and write of this dict, and every mutation of `refcount`/
 #: `broken` on any entry, happens while holding this lock.
-_registry: dict[tuple[str, str], _SharedEntry] = {}
+#: Bug-hunt defect B: the key gained a third element (`port`) so two
+#: targets differing only by port are never folded into the same shared
+#: transport - see `registry._build_ssh_transport`'s own comment.
+_registry: dict[tuple[str, str, int | None], _SharedEntry] = {}
 _registry_lock = threading.Lock()
 
 
@@ -89,7 +92,9 @@ class _SharedEntry:
     `connect()` call itself, so it is never held across the module lock.
     """
 
-    def __init__(self, key: tuple[str, str], transport: SshTransport) -> None:
+    def __init__(
+        self, key: tuple[str, str, int | None], transport: SshTransport
+    ) -> None:
         self.key = key
         self.transport = transport
         self.refcount = 0
@@ -199,7 +204,7 @@ class SharedTransportHandle:
 
 
 def acquire_shared_transport(
-    key: tuple[str, str], factory: Callable[[], SshTransport]
+    key: tuple[str, str, int | None], factory: Callable[[], SshTransport]
 ) -> SharedTransportHandle:
     """Return a handle onto the shared `SshTransport` for `key`, creating one
     via `factory()` if none exists yet (or the previous one was retired).

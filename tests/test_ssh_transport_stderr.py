@@ -86,7 +86,9 @@ def _install_fake_popen(monkeypatch, stderr_data: bytes) -> None:
     # Skip the real `uv` discovery probe (its own subprocess.run call) - it
     # is not what this test is proving.
     monkeypatch.setattr(
-        ssh_transport_mod, "_resolve_uv_command", lambda user_host, ssh_path="ssh": "uv"
+        ssh_transport_mod,
+        "_resolve_uv_command",
+        lambda user_host, ssh_path="ssh", *, port=None: "uv",
     )
 
 

@@ -68,7 +68,9 @@ def test_target_absent_is_the_unchanged_local_path(monkeypatch):
 
 def test_target_present_returns_a_connected_remote_backend(monkeypatch):
     monkeypatch.setattr(
-        registry, "_build_ssh_transport", lambda host, pkg, cfg: _FakeTransport()
+        registry,
+        "_build_ssh_transport",
+        lambda host, pkg, cfg, port=None: _FakeTransport(),
     )
 
     backend = registry.select_backend({"target": "ssh://user@example-host"})
@@ -85,7 +87,7 @@ def test_target_present_never_falls_back_to_local_on_failure(monkeypatch):
     monkeypatch.setattr(
         registry,
         "_build_ssh_transport",
-        lambda host, pkg, cfg: _FakeTransport(fail=True),
+        lambda host, pkg, cfg, port=None: _FakeTransport(fail=True),
     )
 
     with pytest.raises(RemoteTargetUnavailable):
@@ -94,12 +96,14 @@ def test_target_present_never_falls_back_to_local_on_failure(monkeypatch):
 
 def test_malformed_target_raises_a_clear_parse_error(monkeypatch):
     monkeypatch.setattr(
-        registry, "_build_ssh_transport", lambda host, pkg, cfg: _FakeTransport()
+        registry,
+        "_build_ssh_transport",
+        lambda host, pkg, cfg, port=None: _FakeTransport(),
     )
     with pytest.raises(ValueError, match="not a valid ssh://"):
         registry.select_backend({"target": "not-a-valid-target"})
 
 
 def test_target_without_explicit_user_is_accepted():
-    assert registry._parse_target("ssh://myhost") == "myhost"
-    assert registry._parse_target("ssh://user@myhost") == "user@myhost"
+    assert registry._parse_target("ssh://myhost") == ("myhost", None)
+    assert registry._parse_target("ssh://user@myhost") == ("user@myhost", None)

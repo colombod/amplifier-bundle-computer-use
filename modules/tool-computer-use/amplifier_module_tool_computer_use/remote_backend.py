@@ -110,15 +110,29 @@ class RemoteBackend:
         """The actual `user@host` (or bare `host`) string this backend talks
         to - unlike `self.name` (`"remote-ssh:<platform>"`, identical for
         any two different hosts running the same platform), this is unique
-        per TARGET. Used by `__init__.py`'s `_channel_identity` to key the
-        one-disclosure-decision-per-machine cache; every consumer that
+        per TARGET. Used by `__init__.py`'s `_channel_identity` AND
+        `_halt_key` to key the one-disclosure-decision-per-machine cache
+        and the durable-halt-state record respectively; every consumer that
         shares the same target already shares one `SshTransport`/
         `SharedTransportHandle` via `registry._build_ssh_transport`
         (`shared_transport.py`), so `self._transport.user_host` is the same
         string for all of them. `"?"` only if no transport was ever
         configured (should not happen via `registry.select_backend`).
+
+        Bug-hunt defect B: folds in the transport's configured `port` when
+        one is set (`ssh://host:2222`), so two targets that differ ONLY by
+        port are not misidentified as the same physical machine either -
+        the exact same class of bug defect A closed for hostname. `None`
+        port (the common case, standard port 22) leaves this byte-identical
+        to the pre-port-support string - `self._transport.user_host` itself
+        never carries a port (see `SshTransport.port`/`_ssh_opts`, which
+        thread it to `ssh -p` separately instead).
         """
-        return self._transport.user_host if self._transport is not None else "?"
+        if self._transport is None:
+            return "?"
+        host = self._transport.user_host
+        port = getattr(self._transport, "port", None)
+        return f"{host}:{port}" if port else host
 
     # -- connection lifecycle (used by registry.select_backend) -------------
 

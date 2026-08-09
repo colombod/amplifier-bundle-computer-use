@@ -114,6 +114,21 @@ _SSH_OPTS = [
 ]
 
 
+def _ssh_opts(port: int | None) -> list[str]:
+    """`_SSH_OPTS` plus `-p <port>` when a non-standard port is configured
+    (bug-hunt defect B: `ssh://host:port` used to parse successfully and
+    then silently lose the port - no `-p` existed anywhere in this list).
+
+    `port is None` -> exactly `_SSH_OPTS` unchanged, byte for byte - `ssh`
+    itself defaults to port 22 when `-p` is absent, so this is a no-op for
+    every target that does not configure a non-standard port; there is no
+    behavior change for the common case.
+    """
+    if port is None:
+        return list(_SSH_OPTS)
+    return [*_SSH_OPTS, "-p", str(port)]
+
+
 #: Truncation and redaction for stderr captured from a target during a
 #: failed connect/send - long output is dominated by retry noise (the
 #: incident that motivated this: a `uv fetch` failure whose real cause was
@@ -196,7 +211,9 @@ def _build_payload(package_dir: Path) -> bytes:
     return buf.getvalue()
 
 
-def _resolve_uv_command(user_host: str, ssh_path: str = "ssh") -> str:
+def _resolve_uv_command(
+    user_host: str, ssh_path: str = "ssh", *, port: int | None = None
+) -> str:
     """Discover an absolute `uv` path on the target via a short, bounded probe.
 
     Uses Python's own `subprocess.run(..., timeout=...)`, not a shell
@@ -205,9 +222,15 @@ def _resolve_uv_command(user_host: str, ssh_path: str = "ssh") -> str:
     shell-level `timeout`+backgrounding interaction; `subprocess.run(timeout=)`
     kills the `ssh` process directly on expiry, which is not subject to that
     failure mode.
+
+    `port` (bug-hunt defect B): must reach THIS probe too, not just the
+    main `connect()` command below - a non-standard-port target whose `uv`
+    probe still silently went to port 22 would fail confusingly (or worse,
+    succeed against an unrelated host on port 22) before ever reaching the
+    real connection attempt.
     """
     probe = " || ".join(f"command -v {shlex.quote(c)}" for c in UV_CANDIDATES)
-    cmd = [ssh_path, "-n", *_SSH_OPTS, user_host, f"sh -lc {shlex.quote(probe)}"]
+    cmd = [ssh_path, "-n", *_ssh_opts(port), user_host, f"sh -lc {shlex.quote(probe)}"]
     try:
         proc = subprocess.run(
             cmd,
@@ -308,6 +331,7 @@ class SshTransport:
         deadman_seconds: float = 5.0,
         read_only: bool = True,
         with_pillow: bool = True,
+        port: int | None = None,
     ) -> None:
         self.user_host = user_host
         self._package_dir = package_dir
@@ -315,6 +339,10 @@ class SshTransport:
         self._deadman_seconds = deadman_seconds
         self._read_only = read_only
         self._with_pillow = with_pillow
+        # Bug-hunt defect B: a non-standard SSH port. `None` (the default -
+        # ordinary port 22) reproduces every ssh invocation this class made
+        # before this field existed, byte for byte - see `_ssh_opts`.
+        self.port = port
         self._proc: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()
         self._sent_sha256: str | None = None
@@ -329,7 +357,7 @@ class SshTransport:
         payload = _build_payload(self._package_dir)
         self._sent_sha256 = hashlib.sha256(payload).hexdigest()
 
-        uv_cmd = _resolve_uv_command(self.user_host, self._ssh_path)
+        uv_cmd = _resolve_uv_command(self.user_host, self._ssh_path, port=self.port)
         stub = _bootstrap_stub(self._deadman_seconds, self._read_only)
         if self._with_pillow:
             # Mirrors this bundle's own pyproject.toml dependency markers
@@ -353,7 +381,7 @@ class SshTransport:
         else:
             remote_cmd = f"python3 -c {shlex.quote(stub)}"
 
-        cmd = [self._ssh_path, "-T", *_SSH_OPTS, self.user_host, remote_cmd]
+        cmd = [self._ssh_path, "-T", *_ssh_opts(self.port), self.user_host, remote_cmd]
         logger.info("ssh-transport: connecting to %s", self.user_host)
         proc = subprocess.Popen(
             cmd,

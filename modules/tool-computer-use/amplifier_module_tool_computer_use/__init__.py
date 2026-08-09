@@ -36,6 +36,7 @@ import socket
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1053,7 +1054,9 @@ class ComputerTool:
             return
         if status.get("cancelled") and not self._remote_cancel_seen:
             self._remote_cancel_seen = True
-            _on_overlay_cancel(guard, self._backend.name)
+            # Bug-hunt defect A fix: `_halt_key`, not the bare
+            # `backend.name` - see that function's docstring.
+            _on_overlay_cancel(guard, _halt_key(self._backend))
             return
         if status.get("paused") and not self._remote_pause_seen:
             self._remote_pause_seen = True
@@ -1725,7 +1728,10 @@ class ComputerTool:
                 "effective_staleness_ms": exc.snapshot.effective_staleness_ms,
             }
         )
-        backend_name = getattr(self._backend, "name", "unknown")
+        # Bug-hunt defect A fix: `_halt_key(self._backend)`, not the bare
+        # `backend.name` - see that function's docstring for why the bare
+        # composite name is not unique per remote host.
+        backend_name = _halt_key(self._backend)
         record_halt(backend_name, exc.snapshot, reason=str(exc))
         return ToolResult(
             success=False, error={"message": str(exc), "type": type(exc).__name__}
@@ -2582,7 +2588,15 @@ def _build_coexistence_guard(
         # and persists it AFTER this guard already mounted (see
         # `halt_state.make_durable_halt_poll`'s docstring for the real
         # evaluation evidence).
-        durable_halt_poll=make_durable_halt_poll(backend.name),
+        #
+        # Bug-hunt defect A fix: keyed by `_halt_key(backend)`, not
+        # `backend.name` - see that function's docstring for why the bare
+        # composite name is not unique per remote host. A legacy
+        # pre-migration record (written under the old, collision-prone key
+        # by a version of this code before the fix) is also polled, fail-
+        # safe, so it does not silently stop applying the moment this
+        # ships - see `_legacy_halt_key`'s docstring.
+        durable_halt_poll=_durable_halt_poll_for(backend),
     )
     logger.info(
         "coexistence: guard built for backend %r (guard_ms=%.1f, measured=%s)",
@@ -2623,17 +2637,46 @@ def _build_coexistence_guard(
     # the ONLY way past it is an explicit human action (`resolve_resume_command()`
     # below - resolved against THIS process, never a bare name assumed to be
     # on PATH), never the mere passage of time.
-    persisted = load_halt(backend.name)
+    #
+    # Bug-hunt defect A fix: `_halt_key(backend)`, not `backend.name` - see
+    # that function's docstring. Falls back to the pre-fix, platform-wide
+    # `_legacy_halt_key` ONLY when the per-host key has no record, so an
+    # existing halt written before this fix keeps applying (fail-safe) even
+    # though it may have originated on a DIFFERENT host of this platform -
+    # logged distinctly so that ambiguity is never silent.
+    halt_key = _halt_key(backend)
+    persisted = load_halt(halt_key)
+    legacy_key = _legacy_halt_key(backend)
+    used_legacy_key = False
+    if persisted is None and legacy_key is not None:
+        persisted = load_halt(legacy_key)
+        used_legacy_key = persisted is not None
     if persisted is not None:
         guard.seed_halted(persisted.to_snapshot())
-        logger.warning(
-            "coexistence: backend %r has a durable halt record from a prior "
-            "session (reason=%r) - this session starts already HALTED; run "
-            "%s to clear it explicitly (docs/designs/coexistence.md \u00a713 D3)",
-            backend.name,
-            persisted.reason,
-            resolve_resume_command(),
-        )
+        if used_legacy_key:
+            logger.warning(
+                "coexistence: backend %r has no per-host durable halt "
+                "record (key=%r) but a pre-migration, platform-wide one "
+                "exists (key=%r, reason=%r) - honoring it fail-safe since "
+                "it may have been recorded against a DIFFERENT host of "
+                "this same platform; this session starts already HALTED; "
+                "run %s to clear it explicitly, and consider clearing the "
+                "legacy key too (docs/designs/coexistence.md \u00a713 D3)",
+                backend.name,
+                halt_key,
+                legacy_key,
+                persisted.reason,
+                resolve_resume_command(),
+            )
+        else:
+            logger.warning(
+                "coexistence: backend %r has a durable halt record from a prior "
+                "session (reason=%r) - this session starts already HALTED; run "
+                "%s to clear it explicitly (docs/designs/coexistence.md \u00a713 D3)",
+                backend.name,
+                persisted.reason,
+                resolve_resume_command(),
+            )
     return guard
 
 
@@ -2908,6 +2951,84 @@ def _channel_identity(backend: Backend) -> str:
     return f"local:{backend.name}"
 
 
+#: Bug-hunt defect A (verified against `remote_backend.py:73/123`): the
+#: durable-halt-state key handed to `record_halt`/`load_halt`/
+#: `make_durable_halt_poll` was `backend.name` unchanged - identical to the
+#: composite string `_channel_identity` was ALREADY built to avoid using for
+#: exactly this reason (see that function's own docstring, "identical for
+#: any two DIFFERENT hosts that happen to run the same platform"). Two
+#: different remote macOS targets both resolve `backend.name` to
+#: `"remote-ssh:macos"`, so a halt detected on one silently also applied to
+#: the other - never a live safety hole (the direction is fail-SAFE, over-
+#: halting, not under-halting), but wrong, and a future live-retarget
+#: feature must not inherit it.
+def _halt_key(backend: Backend) -> str:
+    """The durable-halt-state key for `backend` - MUST be unique per
+    PHYSICAL target, not per backend TYPE. Local backends are unaffected
+    (`backend.name` alone, e.g. `"linux-x11"`, is already unique enough - a
+    controller process only ever drives one local desktop - so existing
+    local halt records keep applying exactly as before, byte-identical
+    key). Remote backends get `backend.name` (kept, so an existing
+    operator reading a filename/log line still recognizes the platform)
+    plus the backend's own `user_host` (unique per SSH target - see
+    `RemoteBackend.user_host`'s docstring, and note it now folds in the
+    port for a non-standard-port target too - defect B), so two different
+    remote hosts of the same platform now get two different keys/files.
+    """
+    if bool(getattr(backend, "is_remote", False)):
+        host = getattr(backend, "user_host", None)
+        if host:
+            return f"{backend.name}:{host}"
+    return backend.name
+
+
+def _legacy_halt_key(backend: Backend) -> str | None:
+    """The PRE-fix durable-halt key `backend` would have collided under
+    (`backend.name` alone, composite and platform-wide for a remote
+    target) - `None` for local backends, whose key never changed.
+
+    Consulted ONLY as a one-time, read-side migration fallback
+    (`_build_coexistence_guard` below) so a halt record written by a
+    pre-fix version of this code does not silently stop applying the
+    moment this fix ships - a stale key that no longer matches would be a
+    halt that silently stops applying, which is a WORSE defect than the
+    one this closes (over-halting is the fail-safe direction; an
+    unrecognized halt record is not). Deliberately one-directional: NEW
+    halts are only ever written under `_halt_key`'s per-host key (see
+    `_record_halt_result`/`_on_overlay_cancel` callers) - this legacy key
+    is never written to again, only read, so the platform-wide collision
+    this whole fix exists to close cannot reappear going forward.
+    """
+    if bool(getattr(backend, "is_remote", False)) and getattr(
+        backend, "user_host", None
+    ):
+        return backend.name
+    return None
+
+
+def _durable_halt_poll_for(backend: Backend) -> Callable[[], PresenceSnapshot | None]:
+    """Wrap `halt_state.make_durable_halt_poll` for `backend`'s per-host
+    key (`_halt_key`) - and, for remote backends only, ALSO poll the
+    pre-fix platform-wide key (`_legacy_halt_key`) as a fail-safe migration
+    net, so a halt recorded by an older version of this code does not
+    silently stop applying purely because this fix shipped. The per-host
+    poll wins when both would report a halt (it is the accurate one); the
+    legacy poll is only ever consulted when the per-host key has nothing.
+    Local backends: unchanged, a single poll on `backend.name`, identical
+    to pre-fix behavior.
+    """
+    primary = make_durable_halt_poll(_halt_key(backend))
+    legacy_key = _legacy_halt_key(backend)
+    if legacy_key is None:
+        return primary
+    legacy = make_durable_halt_poll(legacy_key)
+
+    def _poll() -> PresenceSnapshot | None:
+        return primary() or legacy()
+
+    return _poll
+
+
 #: Guards `_channel_ledgers`/`_channel_band_state` below - the same
 #: momentary-contention rationale as `_announcement_lock` above (dict
 #: read/write only, never held across a backend call).
@@ -3146,7 +3267,9 @@ def _dispatch_announcement(
                 screen_y=disp.origin_y,
                 exclusion=guard.exclusion,
                 on_pause=lambda: _on_overlay_pause(guard, backend.name),
-                on_cancel=lambda: _on_overlay_cancel(guard, backend.name),
+                # Bug-hunt defect A fix: `_halt_key`, not the bare
+                # `backend.name` - see that function's docstring.
+                on_cancel=lambda: _on_overlay_cancel(guard, _halt_key(backend)),
             )
             overlay.show()
         except Exception as exc:  # noqa: BLE001 - any failure -> the shared \u00a77.6 policy
@@ -3162,7 +3285,9 @@ def _dispatch_announcement(
             screen_y=disp.origin_y,
             exclusion=guard.exclusion,
             on_pause=lambda: _on_overlay_pause(guard, backend.name),
-            on_cancel=lambda: _on_overlay_cancel(guard, backend.name),
+            # Bug-hunt defect A fix: `_halt_key`, not the bare
+            # `backend.name` - see that function's docstring.
+            on_cancel=lambda: _on_overlay_cancel(guard, _halt_key(backend)),
             powershell_path=cfg.get("powershell_path"),
         )
         try:
