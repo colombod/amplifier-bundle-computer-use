@@ -200,6 +200,16 @@ def select_backend(
                 "_transport": _build_ssh_transport(host, package_dir, config),
             }
         )
+        # M1 (docs/designs/capability-awareness.md \u00a74): this used to be a bare
+        # statement - `connect()`'s return value (the whole handshake: probe,
+        # capabilities, permissions, monitors, ops) was computed on the target
+        # and then discarded three lines later. `RemoteBackend.connect()` now
+        # binds it to `backend.handshake` itself (a connect-time SNAPSHOT, not
+        # a live cache - see that method), so `desktop(action="doctor")`
+        # (\u00a75) can report every honest fact already in that dict without
+        # re-probing anything remote. Nothing here needs the return value
+        # directly; the assignment inside `connect()` is what keeps it
+        # reachable.
         backend.connect(
             required_permissions=tuple(config.get("required_permissions") or ()),
             connect_timeout=float(config.get("connect_timeout", 30.0)),

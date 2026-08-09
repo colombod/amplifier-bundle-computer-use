@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import time
 from typing import Any
 
 from .backend import (
@@ -84,6 +85,25 @@ class RemoteBackend:
         # never will be; the underlying platform's measured band is. `None`
         # until `connect()` completes a handshake.
         self.presence_platform: str | None = None
+        # M1 (docs/designs/capability-awareness.md \u00a74/\u00a75.3): the whole
+        # handshake dict `connect()` receives - every permission/capability/
+        # ops fact the agent could determine about ITSELF, computed on the
+        # target. `None` until `connect()` completes. This is a CONNECT-TIME
+        # SNAPSHOT, never refreshed - `doctor` reports it alongside
+        # `handshake_age_seconds` so a stale fact is never presented as
+        # current (permissions can be revoked, a screen can be locked, mid-
+        # session, long after this dict was built).
+        self.handshake: dict[str, Any] | None = None
+        self._connected_at: float | None = None
+
+    @property
+    def handshake_age_seconds(self) -> float | None:
+        """Seconds since `handshake` was captured, or `None` before
+        `connect()` has run. See `handshake`'s own docstring for why this
+        age must travel with every fact read from it."""
+        if self._connected_at is None:
+            return None
+        return time.monotonic() - self._connected_at
 
     @property
     def user_host(self) -> str:
@@ -122,6 +142,10 @@ class RemoteBackend:
         self._connected = True
         self.name = f"remote-ssh:{handshake.get('backend', '?')}"
         self.presence_platform = handshake.get("backend")
+        # M1: bind the handshake instead of letting the caller discard it -
+        # see `handshake`'s own docstring.
+        self.handshake = handshake
+        self._connected_at = time.monotonic()
         return handshake
 
     def close(self) -> None:

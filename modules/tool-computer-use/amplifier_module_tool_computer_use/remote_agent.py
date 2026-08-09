@@ -440,6 +440,16 @@ class RemoteAgent:
             "capabilities": capabilities,
             "permissions": _probe_permissions(self.backend),
             "monitors": monitors,
+            # M2 (docs/designs/capability-awareness.md \u00a72.1/\u00a75.3): this
+            # agent's OWN dispatch table, generated - not prose. \u00a72.1 found a
+            # prose capability table ("nine ops are not implemented over the
+            # wire") that was wrong for 27 commits, in the direction that made
+            # an agent UNDERSTATE what it could do to a real user. A
+            # generated fact cannot go stale the way that table did - the
+            # controller reads this to answer "can I do X on this binding?"
+            # from the agent's own reality instead of from prose that has to
+            # be kept in sync by hand.
+            "ops": sorted(self._HANDLERS),
         }
 
     def run(self, stdin: Any, stdout: Any) -> None:

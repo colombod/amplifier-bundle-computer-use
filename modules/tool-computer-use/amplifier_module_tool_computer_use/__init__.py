@@ -1788,6 +1788,11 @@ DESKTOP_ACTIONS = [
     "set_clipboard",
     "list_monitors",
     "select_monitor",
+    # M3 (docs/designs/capability-awareness.md \u00a75): the capability report -
+    # see `DesktopTool.execute`'s disclosure-exemption comment for why this
+    # one action is dispatched before `_ensure_announced`, and
+    # `_build_doctor_report` for the hard content boundary that earns it.
+    "doctor",
 ]
 
 #: Clipboard *reads* travel to the model provider as tool output (see README Safety
@@ -1805,6 +1810,54 @@ _READ_ONLY_BLOCKED = {"focus_window", "set_clipboard", "get_clipboard"}
 #: `get_clipboard` is a read (already covered by `_READ_ONLY_BLOCKED` above for
 #: its exfiltration risk, not because it changes anything).
 MUTATING_DESKTOP = {"focus_window", "set_clipboard"}
+
+#: M3 action-surface computation (docs/designs/capability-awareness.md \u00a75.3):
+#: every `computer`/`desktop` action mapped to the ONE underlying `Backend`
+#: call (and therefore the one remote wire op - `remote_agent.py`'s
+#: `_HANDLERS` keys are the SAME names, see `remote_backend.py`'s
+#: `RemoteBackend` methods) it actually depends on. `None` means the action
+#: never reaches `Backend` at all (`wait` is a bare `time.sleep`) - such an
+#: action is never "not carried by this binding", remote or local.
+#: `select_monitor` depends on the same enumeration `list_monitors` does
+#: (`ComputerTool.select_monitor` reads `self._monitors`, refreshed via the
+#: same backend call - see that method).
+_ACTION_WIRE_OP: dict[str, str | None] = {
+    "screenshot": "capture_scaled",
+    "zoom": "capture_scaled",
+    "cursor_position": "cursor_position",
+    "mouse_move": "move",
+    "left_click": "click",
+    "right_click": "click",
+    "middle_click": "click",
+    "double_click": "click",
+    "triple_click": "click",
+    "left_mouse_down": "mouse_down",
+    "left_mouse_up": "mouse_up",
+    "left_click_drag": "drag",
+    "scroll": "scroll",
+    "key": "key",
+    "hold_key": "hold_key",
+    "type": "type_text",
+    "wait": None,
+    "screen_info": "screen_geometry",
+    "list_windows": "list_windows",
+    "focus_window": "focus_window",
+    "get_clipboard": "get_clipboard",
+    "set_clipboard": "set_clipboard",
+    "list_monitors": "list_monitors",
+    "select_monitor": "list_monitors",
+}
+
+#: Actions that synthesize input (click/type/key/scroll/focus) and therefore
+#: depend on macOS Accessibility being granted - the exact set `MUTATING`
+#: already names for the read_only gate (\u00a73.1: "Accessibility granted?" ->
+#: `AXIsProcessTrusted()`), reused rather than re-declared so the two lists
+#: cannot drift apart.
+_ACCESSIBILITY_GATED_ACTIONS = MUTATING
+
+#: Actions that read pixels and therefore depend on macOS Screen Recording
+#: being granted (\u00a73.1: `CGPreflightScreenCaptureAccess()`).
+_SCREEN_RECORDING_GATED_ACTIONS = {"screenshot", "zoom"}
 
 
 class DesktopTool:
@@ -1880,6 +1933,36 @@ class DesktopTool:
         }
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
+        # M3 disclosure-gate exemption (docs/designs/capability-awareness.md
+        # \u00a75.4) - dispatched BEFORE `_ensure_announced`, deliberately, and
+        # this is the one place in the whole module that is. `doctor` is the
+        # orienting call an agent makes to find out what it can do here,
+        # including whether a dialog is about to appear - gating it behind
+        # the same disclosure check every other action goes through would
+        # mean the FIRST call ever made against a fresh macOS binding pops a
+        # 30s modal on someone's Mac before the agent could say a word about
+        # it, and an agent cannot warn a human about a dialog using the tool
+        # that fires it. That chicken-and-egg is real, not hypothetical - see
+        # \u00a78 of the design doc's end-to-end walkthrough (step 1: `doctor` on
+        # a fresh binding, before anything else has happened).
+        #
+        # This is a SECOND door past the one gate `_ensure_announced`'s own
+        # docstring insists on ("exactly one gate, not one gate for writes
+        # and a silent hole for reads") - that argument's stated reason is
+        # CONTENT ("a screenshot IS a capture of a human's screen"), and the
+        # exemption earns its keep only by removing exactly that: `doctor`
+        # reports about the machine, never anything on it. See
+        # `_build_doctor_report`'s docstring for the hard boundary this
+        # promise depends on, and `test_doctor_cannot_return_screen_contents`
+        # for the structural proof, not just a comment asserting it.
+        #
+        # Also unlike the OTHER path that skips this gate - the mount-failure
+        # stub (`ComputerUseUnavailableTool`, only registered when mount()
+        # could not get a working backend at all) - `doctor` lives on the tool
+        # that DID mount. It answers "what can I do on the machine I am bound
+        # to", which only has an answer once there is a machine.
+        if str(input.get("action") or "").strip() == "doctor":
+            return _build_doctor_report(self._computer)
         # Same gate `computer` runs first (see `ComputerTool._ensure_announced`
         # and `ComputerTool.execute`'s own docstring) - `desktop` shares the
         # SAME `ComputerTool` instance, so this reuses (and, if this is the
@@ -2068,6 +2151,356 @@ class DesktopTool:
             return ToolResult(
                 success=False, error={"message": str(exc), "type": type(exc).__name__}
             )
+
+
+def _display_server_report(backend: Backend) -> dict[str, Any] | None:
+    """Best-effort, side-effect-free report of which display server this
+    binding is actually running under (docs/designs/capability-awareness.md
+    \u00a72.3c/\u00a73.3): `LinuxX11Backend.probe()` checks `DISPLAY`/`XAUTHORITY`/
+    session-match only, and ACTIVELY SUCCEEDS on a Wayland session - XWayland's
+    own auth file is one of the candidates `linux_x11._resolve_xauthority`
+    tries. Ubuntu 24.04 defaults to Wayland, so this is not a hypothetical
+    edge case.
+
+    Never claims a confirmation the probe never made: `verified=True` only
+    for a session that positively reports `XDG_SESSION_TYPE=x11`; a detected
+    Wayland/XWayland session, or no signal at all, is reported
+    `verified=False` with an honest reason - never silently promoted to
+    \"x11 (works)\".
+
+    `None` when this binding is not local Linux X11 (macOS/Windows have no
+    such ambiguity) or is a REMOTE target (this reads the CONTROLLER's own
+    environment variables, which say nothing about a target's session type;
+    reporting them for a remote binding would be exactly the kind of guess
+    this whole feature exists to refuse).
+    """
+    if backend.name != "linux-x11" or bool(getattr(backend, "is_remote", False)):
+        return None
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
+    wayland_display = os.environ.get("WAYLAND_DISPLAY")
+    if session_type == "wayland" or wayland_display:
+        return {
+            "value": "wayland-or-xwayland",
+            "verified": False,
+            "note": (
+                f"this session reports Wayland (XDG_SESSION_TYPE={session_type!r}, "
+                f"WAYLAND_DISPLAY={wayland_display!r}) - the X11 probe that "
+                "mounted this backend does not check for Wayland and can "
+                "succeed via XWayland's own auth file "
+                "(docs/designs/capability-awareness.md \u00a72.3c). Input/capture "
+                "behavior under XWayland is UNVERIFIED by this codebase; do "
+                "not assume it matches native X11."
+            ),
+        }
+    if session_type == "x11":
+        return {
+            "value": "x11",
+            "verified": True,
+            "note": "XDG_SESSION_TYPE=x11 - a native X11 session, not XWayland.",
+        }
+    return {
+        "value": "unknown",
+        "verified": False,
+        "note": (
+            "XDG_SESSION_TYPE is not set (or unrecognised) - cannot determine "
+            "whether this is native X11 or XWayland; the probe that mounted "
+            "this backend does not check either way, so this is reported as "
+            "unverified rather than assumed to be plain X11."
+        ),
+    }
+
+
+def _macos_permission_state(backend: Backend) -> dict[str, Any]:
+    """Tri-state (\u00a73.4) permission + session-lock facts for a macOS binding -
+    the ONLY platform with a permission model at all (\u00a73.2/\u00a73.3: Windows and
+    Linux have none). Never collapses \"could not determine\" into \"denied\" -
+    a missing/unknown fact is reported as `\"unknown\"`, exactly like the
+    connect-time handshake probe already does
+    (`remote_agent._probe_permissions`) and for the same reason.
+
+    LOCAL macOS: probed LIVE, prompt-free - the same ctypes calls
+    `remote_agent._probe_permissions` uses on the target side.
+    REMOTE macOS: read from the connect-time handshake (M1) - never
+    re-probed live (no wire op for it exists in this build); the
+    handshake's own age is surfaced alongside so this is never mistaken for
+    a fresh read.
+    Anything else (Windows, Linux, remote windows/linux): `applicable: False`
+    - there is no TCC-style gate on those platforms at all.
+    """
+    is_remote = bool(getattr(backend, "is_remote", False))
+    platform_name = (
+        getattr(backend, "presence_platform", None) if is_remote else backend.name
+    )
+    if platform_name != "macos":
+        return {
+            "applicable": False,
+            "note": f"{platform_name or backend.name!r} has no TCC-style permission model",
+        }
+
+    def _tri(value: bool | None) -> str:
+        if value is None:
+            return "unknown"
+        return "granted" if value else "denied"
+
+    if is_remote:
+        handshake = getattr(backend, "handshake", None) or {}
+        permissions = handshake.get("permissions") or {}
+        return {
+            "applicable": True,
+            "accessibility": _tri(permissions.get("accessibility")),
+            "screen_recording": _tri(permissions.get("screen_recording")),
+            "session_state": "unknown",
+            "source": "connect-time handshake snapshot (M1)",
+            "snapshot_age_seconds": getattr(backend, "handshake_age_seconds", None),
+            "note": (
+                "session lock state is not queried for a remote macOS target "
+                "in this build (no wire op exists for it yet) - a locked "
+                "screen and a missing grant are indistinguishable without it."
+            ),
+        }
+    accessibility = "unknown"
+    screen_recording = "unknown"
+    session_state = "unknown"
+    try:
+        from . import macos as _macos  # local import: only importable on Darwin
+
+        accessibility = _tri(_macos._ax_is_process_trusted())
+        screen_recording = _tri(_macos._cg_preflight_screen_capture_access())
+        session_state, _detail = _macos._macos_session_state()
+    except Exception:  # noqa: BLE001 - best-effort diagnostic, never fatal
+        logger.debug("doctor: macOS permission probe failed", exc_info=True)
+    return {
+        "applicable": True,
+        "accessibility": accessibility,
+        "screen_recording": screen_recording,
+        "session_state": session_state,
+        "source": "live probe (prompt-free)",
+        "note": (
+            "which PROCESS must hold these grants cannot be determined from "
+            "here - TCC binds to the responsible process, which differs by "
+            "launch chain (docs/designs/capability-awareness.md \u00a73.1)."
+        ),
+    }
+
+
+def _action_surface(computer: ComputerTool) -> dict[str, Any]:
+    """Compute the works / blocked-by-policy / blocked-by-os-permission /
+    not-carried-by-binding split for every `computer` + `desktop` action
+    (docs/designs/capability-awareness.md \u00a75.3, plus the council's 4th
+    bucket). Exactly one bucket per action, in this precedence order:
+
+      1. not carried by this binding at all
+      2. blocked by a CONFIRMED macOS permission denial - \"dispatched, not
+         policy-blocked, but the OS will silently refuse it\". This is the
+         council's finding: a naive report could say `drag: works` while
+         Accessibility is denied, which is the same confident-wrong-answer
+         failure this whole design exists to close, one layer down.
+      3. blocked by this session's own policy (read_only / gate_writes)
+      4. works
+
+    \"Unknown\" permission state (\u00a73.4: never collapsed into \"denied\") does
+    NOT move an action into bucket 2 - it stays in `permissions` (tri-state),
+    so a user is told to go look, never told a false negative.
+    """
+    backend = computer._backend
+    is_remote = computer._is_remote
+    ops: set[str] | None = None
+    if is_remote:
+        handshake = getattr(backend, "handshake", None) or {}
+        raw_ops = handshake.get("ops")
+        if isinstance(raw_ops, list):
+            ops = set(raw_ops)
+
+    permissions = _macos_permission_state(backend)
+
+    def _permission_denied(action: str) -> str | None:
+        if not permissions.get("applicable"):
+            return None
+        if (
+            action in _SCREEN_RECORDING_GATED_ACTIONS
+            and permissions.get("screen_recording") == "denied"
+        ):
+            return "screen_recording"
+        if (
+            action in _ACCESSIBILITY_GATED_ACTIONS
+            and permissions.get("accessibility") == "denied"
+        ):
+            return "accessibility"
+        return None
+
+    def _policy_reason(action: str) -> str | None:
+        if computer._read_only and (action in MUTATING or action in _READ_ONLY_BLOCKED):
+            return "blocked: mounted read_only"
+        if (
+            action in MUTATING_DESKTOP
+            and computer._gate_writes
+            and not computer._unattended_writes_ok
+            and not computer._interactive_write_approved
+        ):
+            return (
+                "blocked: gate_writes is on and nothing has approved this "
+                "write yet (no gate hook, no unattended_writes_ok, no "
+                "interactive approval this call)"
+            )
+        return None
+
+    works: list[str] = []
+    blocked_by_policy: dict[str, str] = {}
+    blocked_by_os_permission: dict[str, str] = {}
+    not_carried: dict[str, str] = {}
+
+    for action in sorted(_ACTION_WIRE_OP):
+        op = _ACTION_WIRE_OP[action]
+        if op is not None and is_remote:
+            if ops is None:
+                not_carried[action] = (
+                    "unknown: this remote agent's handshake did not report "
+                    "its dispatch table (ops) - cannot assert this action is "
+                    "carried, so it is not assumed to be"
+                )
+                continue
+            if op not in ops:
+                not_carried[action] = (
+                    f"not carried: this binding's agent has no {op!r} handler"
+                )
+                continue
+        denied_gate = _permission_denied(action)
+        if denied_gate is not None:
+            blocked_by_os_permission[action] = (
+                f"dispatched, but macOS has DENIED {denied_gate!r} to this "
+                "process - the action would reach the OS and be silently "
+                'refused, not "work" (see this report\'s own permissions '
+                "section for the exact pane to grant it in)"
+            )
+            continue
+        policy_reason = _policy_reason(action)
+        if policy_reason is not None:
+            blocked_by_policy[action] = policy_reason
+            continue
+        works.append(action)
+
+    return {
+        "works": works,
+        "blocked_by_policy": blocked_by_policy,
+        "blocked_by_os_permission": blocked_by_os_permission,
+        "not_carried_by_binding": not_carried,
+    }
+
+
+def _config_source(cfg: dict[str, Any], key: str, *, is_remote: bool) -> str:
+    """Whether an effective policy value came from explicit config or from
+    this module's own local/remote default (\u00a75.3: \"a user asking why can't
+    you click needs to know whether to change a setting or a machine\")."""
+    if cfg.get(key) is not None:
+        return "config"
+    return "remote-default" if is_remote else "local-default"
+
+
+def _safety_state(computer: ComputerTool) -> dict[str, Any]:
+    guard = computer._coexistence_guard
+    if guard is None:
+        return {
+            "guard": None,
+            "note": (
+                "no coexistence guard for this backend - no halt protection "
+                "and no disclosure channel (docs/designs/coexistence.md \u00a75.5)"
+            ),
+        }
+    out: dict[str, Any] = {
+        "guard": guard.as_dict(),
+        "guard_ms": guard.presence.guard_ms,
+        "guard_measured": guard.presence.guard_measured,
+    }
+    if guard.halted:
+        out["resume_command"] = resolve_resume_command()
+    return out
+
+
+def _bound_target(computer: ComputerTool) -> dict[str, Any]:
+    backend = computer._backend
+    is_remote = computer._is_remote
+    out: dict[str, Any] = {"name": backend.name, "is_remote": is_remote}
+    if is_remote:
+        out["user_host"] = getattr(backend, "user_host", None)
+        out["presence_platform"] = getattr(backend, "presence_platform", None)
+        out["handshake_age_seconds"] = getattr(backend, "handshake_age_seconds", None)
+        out["note"] = (
+            "handshake-derived facts in this report (action carriage, "
+            "permissions) are a CONNECT-TIME SNAPSHOT, not live - see "
+            "handshake_age_seconds. Permissions can be revoked and the "
+            "screen can be locked mid-session, long after this snapshot."
+        )
+    return out
+
+
+def _target_mode(computer: ComputerTool) -> dict[str, Any]:
+    """Current monitor targeting + the config.target shape fact, reused
+    VERBATIM from `registry._TARGET_MODEL` (\u00a75.3: \"never paraphrased, so it
+    cannot drift from the two places that already share it\").
+
+    Calls `list_monitors()` for a fresh count - geometry only, explicitly
+    permitted by the \u00a75.4 content boundary (hardware, not content).
+    """
+    current = computer.current_monitor
+    try:
+        monitor_count: int | str = len(computer.list_monitors())
+    except BackendError as exc:
+        monitor_count = f"unavailable: {exc}"
+    return {
+        "mode": "virtual-desktop" if current is None else f"monitor:{current.id}",
+        "monitor_count": monitor_count,
+        "target_shape": _TARGET_MODEL,
+    }
+
+
+def _build_doctor_report(computer: ComputerTool) -> ToolResult:
+    """`desktop(action=\"doctor\")` (docs/designs/capability-awareness.md \u00a75) -
+    the capability report. Read-only and side-effect-free beyond one
+    monitor-geometry enumeration (\u00a75.4 explicitly permits that: hardware,
+    not content) and, on local macOS, two prompt-free TCC preflight calls
+    plus one `ioreg` shell-out for lock state - all already proven side-
+    effect-free (\u00a73.1 / `remote_agent._probe_permissions`).
+
+    HARD BOUNDARY (\u00a75.4, and this is what earns the disclosure-gate
+    exemption in `DesktopTool.execute`): this function reads cached
+    handshake/config/guard state and calls `list_monitors` (geometry only,
+    justified above) - it must NEVER call `capture`, `capture_scaled`,
+    `cursor_position`, `list_windows`, or `get_clipboard`.
+    `test_doctor_cannot_return_screen_contents` enforces this at runtime by
+    making every one of those methods raise if called - not just a comment
+    asserting it.
+    """
+    report: dict[str, Any] = {
+        "bound_target": _bound_target(computer),
+        "action_surface": _action_surface(computer),
+        "permissions": _macos_permission_state(computer._backend),
+        "display_server": _display_server_report(computer._backend),
+        "effective_policy": {
+            "read_only": {
+                "value": computer._read_only,
+                "source": _config_source(
+                    computer._cfg, "read_only", is_remote=computer._is_remote
+                ),
+            },
+            "gate_writes": {
+                "value": computer._gate_writes,
+                "source": _config_source(
+                    computer._cfg, "gate_writes", is_remote=computer._is_remote
+                ),
+            },
+            "clipboard_read_policy": {
+                "value": computer._clipboard_read_policy,
+                "source": _config_source(
+                    computer._cfg,
+                    "clipboard_read_policy",
+                    is_remote=computer._is_remote,
+                ),
+            },
+        },
+        "safety_state": _safety_state(computer),
+        "target_mode": _target_mode(computer),
+    }
+    return ToolResult(success=True, output=json.dumps(report, indent=2, default=str))
 
 
 def _build_coexistence_guard(
