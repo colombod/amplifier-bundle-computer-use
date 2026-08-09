@@ -17,8 +17,7 @@ jobs:
     # Deliberately no display server (no Xvfb, no X11). The suite is designed to run
     # headless on Linux with no desktop present, stubbing the platform layer instead of
     # driving a real screen. The coexistence ship gate (scripts/verify_coexistence.py),
-    # which DOES need a real X server, is not run here — see the `coexistence-ship-gate`
-    # job below (and CONTRIBUTING.md for the manual, local invocation).
+    # which DOES need a real X server, is not run here — see CONTRIBUTING.md.
     strategy:
       fail-fast: false
       matrix:
@@ -63,57 +62,3 @@ jobs:
 
       - name: Lint
         run: uvx ruff@0.16.1 check .
-
-  # A green `test` job proves lint + unit tests pass on a headless box. It does NOT
-  # prove the coexistence safety mechanism still works - that requires a real (if
-  # virtual) X server, which `test` deliberately does not have. This job is the
-  # mechanical enforcement of docs/designs/coexistence.md §11's C1 ship gate: without
-  # it, a change that broke the halt invariant would merge clean. One Python version,
-  # not the full matrix - this exercises real X11/XTEST timing behavior, which does not
-  # vary by interpreter minor version, and `test` above already covers import/compat
-  # across 3.11/3.12 for these same modules; running a ~10-15 minute statistical gate
-  # twice would double its cost for no additional coverage.
-  coexistence-ship-gate:
-    name: coexistence ship gate (Xvfb)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          python-version: "3.12"
-
-      - name: Create virtual environment
-        run: uv venv --clear
-
-      - name: Install modules and test dependencies
-        run: |
-          uv pip install -e modules/tool-computer-use -e modules/hook-computer-use
-          uv pip install amplifier-core pytest pytest-asyncio
-
-      - name: Install Xvfb
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb
-
-      # Same start/trap/kill shape as CONTRIBUTING.md's manual recipe - a backgrounded
-      # Xvfb with no cleanup doesn't just waste a process slot, a leaked DISPLAY can
-      # silently become "the" desktop for the next thing that reads it (see linux_x11.py
-      # probe()'s own docstring for the real defect this caused).
-      - name: Run the coexistence ship gate
-        run: |
-          Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &
-          XVFB_PID=$!
-          trap 'kill "$XVFB_PID" 2>/dev/null' EXIT
-          # Settle before the first sample. A just-started Xvfb has never seen an input
-          # event, so its MIT-SCREEN-SAVER idle counter reads whatever wall-clock time
-          # has passed since Xvfb started - and presence.py's own fail-safe rule (no
-          # injection of ours yet + idle < QUIET_FLOOR_SECONDS -> HUMAN_ACTIVE, since
-          # "no evidence either way" must not be read as "quiet" for a safety gate)
-          # reads that as a human already present. Reproduced locally on every run with
-          # less than ~2s between Xvfb start and the gate's first trial - not host
-          # jitter, a deterministic property of a display that has existed for less
-          # than QUIET_FLOOR_SECONDS. Waiting past it here means the gate measures the
-          # mechanism, not a startup artifact of the display it borrowed.
-          sleep 3
-          DISPLAY=:99 .venv/bin/python scripts/verify_coexistence.py

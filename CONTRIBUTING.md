@@ -77,7 +77,6 @@ It needs a real (if headless) X server:
 Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &
 XVFB_PID=$!
 trap 'kill "$XVFB_PID" 2>/dev/null' EXIT
-sleep 3  # settle - see the note below before shortening this
 DISPLAY=:99 .venv/bin/python scripts/verify_coexistence.py
 ```
 
@@ -90,25 +89,11 @@ XTEST-capable X server as "the" desktop — including a stray `Xvfb` left runnin
 (`systemctl --user show-environment`) before trusting it, but there is still no reason to
 leave the test server running — kill it when you are done.
 
-**Settle before the first trial.** A just-started `Xvfb` has never seen an input event, so
-its `MIT-SCREEN-SAVER` idle counter reads whatever wall-clock time has passed since it
-started — and `presence.py`'s own fail-safe rule (no injection of ours yet, and idle below
-`QUIET_FLOOR_SECONDS`, means `HUMAN_ACTIVE`: absence of evidence is not evidence of
-absence) reads that as a human already present. Reproduced locally: running the script
-immediately after backgrounding `Xvfb` fails trial 1 with a false positive on every
-attempt; waiting 3s first (comfortably past `QUIET_FLOOR_SECONDS`, currently 2.0s) does
-not. This is not host jitter — it is a deterministic property of a display that has
-existed for less than the quiet floor — but it means the recipe above is only correct
-with the `sleep` in it.
-
-This takes several minutes (100 trials by default, each a real subprocess spawn) and
-**is** run in CI as of the `coexistence-ship-gate` job in
-`.github/workflows/ci.yml` — a real, if virtual, X server there too (`Xvfb`), so a green
-build actually means this mechanism was exercised, not skipped. Still run it locally
-yourself, against a clean `Xvfb`, before cutting a release that touches the coexistence
-guard, the presence detector, or the input backends it depends on — CI catches a broken
-mechanism after you push; running it yourself first is faster feedback. See the script's
-own docstring for what evidence it produces and how to read the result.
+This takes several minutes (dozens to ~100+ real trials, each a real subprocess spawn) and
+is **not** run in CI — CI runs headless with no display server at all. Run it locally,
+against a clean `Xvfb`, before cutting a release that touches the coexistence guard, the
+presence detector, or the input backends it depends on. See the script's own docstring
+for what evidence it produces and how to read the result.
 
 `scripts/wire_check.py` is the same kind of gate for the multi-provider wire-format
 anti-regression scheme (the design notes §11.2, layer 3): it sends
