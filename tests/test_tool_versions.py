@@ -26,6 +26,7 @@ from amplifier_module_tool_computer_use.tool_versions import (
 SONNET_4_5 = "claude-sonnet-4-5-20250929"
 SONNET_5 = "claude-sonnet-5"
 OPUS_5 = "claude-opus-5"
+HAIKU_4_5 = "claude-haiku-4-5-20251001"
 
 
 # -- required_for_model (the verified table) ---------------------------------
@@ -44,8 +45,20 @@ def test_required_for_model_prefix_matches_a_dated_release():
     assert required_for_model("claude-opus-5-20260401") == "computer_20251124"
 
 
+def test_required_for_model_haiku_4_5_is_verified():
+    """Issue #1: live 400/200 pair captured against the real API -
+    claude-haiku-4-5-20251001 + computer_20251124 -> 400 "does not support
+    tool types"; the same model + computer_20250124 -> 200. Haiku is not
+    incompatible with computer use, it requires the OLDER tool type - the
+    defect was that nothing declared this, so the dated-generation prefix
+    match below (mirroring SONNET_4_5/SONNET_5 above) must resolve it.
+    """
+    assert required_for_model("claude-haiku-4-5") == "computer_20250124"
+    assert required_for_model(HAIKU_4_5) == "computer_20250124"
+
+
 def test_required_for_model_unknown_returns_none():
-    assert required_for_model("claude-haiku-4-5") is None
+    assert required_for_model("claude-haiku-9") is None
     assert required_for_model("") is None
     assert required_for_model(None) is None  # type: ignore[arg-type]
 

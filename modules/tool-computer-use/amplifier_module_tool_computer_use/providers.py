@@ -269,6 +269,12 @@ ANTHROPIC = Dialect(
         "claude-sonnet-4-5": "computer_20250124",
         "claude-sonnet-5": "computer_20251124",
         "claude-opus-5": "computer_20251124",
+        # Verified live 2026-08 (issue #1): claude-haiku-4-5-20251001 +
+        # computer_20251124 -> 400 "does not support tool types"; the same
+        # model + computer_20250124 -> 200 (native tool_use). Haiku is not
+        # incompatible with computer use - it requires the OLDER tool type,
+        # same generation FALLBACK_TOOL_VERSION points past.
+        "claude-haiku-4-5": "computer_20250124",
     },
     beta_headers={
         "computer_20251124": "computer-use-2025-11-24",

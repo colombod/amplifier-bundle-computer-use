@@ -873,19 +873,31 @@ class ComputerTool:
         return beta_header_for(self._tool_version)
 
     def note_model(self, model: str | None) -> None:
-        """Re-resolve `tool_version` for the model about to receive THIS request.
+        """Re-resolve `tool_version` for the model about to receive a request.
 
-        Called by hook-computer-use's wrapped `provider.complete()`
-        (`_note_model_on_computer_tool`, `hook-computer-use/__init__.py`) with
-        `request.model` on every request, before forwarding the request to the
-        real provider - see `tool_versions.py` module docstring. This corrects
-        `_tool_version` for the *next* time `native_tool_spec` is read (that
-        property is read earlier in the same turn, by the orchestrator's own
-        `ToolSpec` construction, before `provider.complete()` is ever called -
-        so a correction here lands one turn ahead of the read it protects, not
-        retroactively inside the same turn). Never raises: a mid-session
-        exception here would take down the whole request, the exact class of
-        bug D3 already fixed once for `native_tool_spec` itself.
+        Called by hook-computer-use (`_note_model_on_computer_tool`,
+        `hook-computer-use/__init__.py`) from two sites - see `tool_versions.py`
+        module docstring for the resolution policy this applies:
+
+        1. Once at wrap time (mount-priming), with the provider's own
+           `default_model`, BEFORE this session's first `native_tool_spec` read.
+        2. On every subsequent `provider.complete()` call, with
+           `request.model or provider.default_model`.
+
+        Site 1 exists because site 2 alone is one turn late: `native_tool_spec`
+        is read earlier in the same turn, by the orchestrator's own `ToolSpec`
+        construction, before `provider.complete()` is ever called - so a
+        correction inside `complete()` lands one turn ahead of the read it
+        protects, not retroactively inside the same turn. A long-lived parent
+        session survives that lag (session continuity carries `_tool_version`
+        into the next turn). A short-lived sub-agent does not: its first
+        request is also its only one, so nothing inside `complete()` can ever
+        correct it in time - the correction has to already be in place before
+        that first read, which is exactly what wrap-time priming provides.
+
+        Never raises: a mid-session exception here would take down the whole
+        request, the exact class of bug D3 already fixed once for
+        `native_tool_spec` itself.
         """
         resolved, corrected = resolve_tool_version(
             model, self._configured_tool_version, previous=self._tool_version

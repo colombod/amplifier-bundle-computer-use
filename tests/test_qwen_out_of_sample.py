@@ -74,6 +74,7 @@ def test_the_three_shipped_dialects_are_bit_identical_with_the_probe_present():
     desktop."""
     assert providers.model_tool_types() == {
         "claude-sonnet-4-5": "computer_20250124",
+        "claude-haiku-4-5": "computer_20250124",
         "claude-sonnet-5": "computer_20251124",
         "claude-opus-5": "computer_20251124",
         "gpt-5.5": "computer",

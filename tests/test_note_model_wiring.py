@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT / "modules" / "hook-computer-use"))
 import amplifier_module_hook_computer_use as hook_mod
 import pytest
 from amplifier_module_tool_computer_use import ComputerTool
+from amplifier_module_tool_computer_use.geometry import Display
 
 
 class _FakeBackend:
@@ -43,11 +44,32 @@ class _FakeBackend:
         pass
 
 
+def _with_resolved_display(computer: ComputerTool) -> ComputerTool:
+    """`native_tool_spec` requires display geometry to already be resolved
+    (normally done once by `mount()`, via `resolve_display()`, against a real
+    backend). These tests exercise tool_version resolution only, so a fixed
+    `Display` is set directly rather than driving a fake backend through the
+    full monitor-enumeration path."""
+    computer._display = Display(
+        screen_width=1920, screen_height=1080, model_width=1280, model_height=720
+    )
+    return computer
+
+
 class _AnthropicProviderNoStream:
     """Today's real shape: `complete()` plus a working
-    `_derive_native_tool_betas()` (PR #79) - must wrap successfully."""
+    `_derive_native_tool_betas()` (PR #79) - must wrap successfully.
+
+    `default_model` mirrors the real provider attribute the fix reads:
+    the model this provider instance actually answers with when no
+    per-request override is set (`ChatRequest.model` is `None`, the common
+    case - see `_note_model_on_computer_tool`'s docstring).
+    """
 
     __module__ = "amplifier_module_provider_anthropic"
+
+    def __init__(self, default_model: str | None = None) -> None:
+        self.default_model = default_model
 
     async def complete(self, request, **kwargs):
         return "ok"
@@ -135,6 +157,104 @@ def test_wrapped_complete_never_raises_when_request_has_no_model_attribute():
     result = _run(provider.complete(_RequestNoModel()))
     assert result == "ok"
     assert computer._tool_version == "computer_20251124"  # unchanged, no flapping
+
+
+# -- Issue #1: mount-time priming closes the "one turn late" gap -----------
+
+
+def test_wrap_provider_primes_tool_version_before_any_request_is_sent():
+    """The defect that 400s a sub-agent's FIRST and only request: mount-time
+    config says claude-opus-5 (-> computer_20251124), but this provider
+    instance's `default_model` is actually claude-haiku-4-5 (->
+    computer_20250124, issue #1's verified row). Before this fix, nothing
+    corrected `_tool_version` until AFTER `provider.complete()` ran once -
+    one turn too late for a session that only gets one turn.
+
+    `_wrap_provider` must correct it as a side effect of wrapping alone,
+    with `complete()` never having been called at all.
+    """
+    computer = ComputerTool(_FakeBackend(), {"model": "claude-opus-5"})
+    assert computer._tool_version == "computer_20251124"  # mount-time baseline
+
+    coord = _FakeCoordinator({"computer": computer})
+    provider = _AnthropicProviderNoStream(default_model="claude-haiku-4-5-20251001")
+    assert hook_mod._wrap_provider(provider, coord, max_inline=3) is True
+
+    # No request sent yet - priming alone must have already corrected this.
+    assert computer._tool_version == "computer_20250124"
+
+
+def test_native_tool_spec_read_before_the_first_request_is_already_correct():
+    """The ordering bug, demonstrated the way the orchestrator actually
+    triggers it: `native_tool_spec` (which the orchestrator's ToolSpec
+    construction reads to build the tool list) is read BEFORE
+    `provider.complete()` is ever called for the turn. A correction that
+    only takes effect *inside* `complete()` arrives one read too late for a
+    sub-agent's single turn - this test fails without wrap-time priming,
+    because reading `native_tool_spec` here happens strictly before any
+    `complete()` call exists to correct it.
+    """
+    computer = _with_resolved_display(
+        ComputerTool(_FakeBackend(), {"model": "claude-opus-5"})
+    )
+    coord = _FakeCoordinator({"computer": computer})
+    provider = _AnthropicProviderNoStream(default_model="claude-haiku-4-5-20251001")
+    hook_mod._wrap_provider(provider, coord, max_inline=3)
+
+    # Simulates the orchestrator building this turn's ToolSpec: read BEFORE
+    # complete() is ever invoked. A sub-agent that 400s on this exact request
+    # never gets a second read - this must already be right.
+    assert computer.native_tool_spec["type"] == "computer_20250124"
+
+
+def test_wrap_provider_priming_leaves_a_verified_model_unchanged():
+    """No regression to the parent/long-lived-session path: an
+    already-verified model (claude-opus-5) must still resolve to
+    computer_20251124 after wrap-time priming - the fix must not flip a
+    correct pairing to something else."""
+    computer = _with_resolved_display(
+        ComputerTool(_FakeBackend(), {"model": "claude-opus-5"})
+    )
+    coord = _FakeCoordinator({"computer": computer})
+    provider = _AnthropicProviderNoStream(default_model="claude-opus-5")
+    hook_mod._wrap_provider(provider, coord, max_inline=3)
+
+    assert computer._tool_version == "computer_20251124"
+    assert computer.native_tool_spec["type"] == "computer_20251124"
+
+
+def test_wrapped_complete_falls_back_to_provider_default_model_when_request_model_is_none():
+    """`request.model` is normally `None` (no per-request override) - the
+    wrapped `complete()` must still resolve the correct tool_version from
+    `provider.default_model` on every request, not only at wrap time. Proves
+    the per-request half of the fix independently of mount-time priming."""
+    computer = ComputerTool(_FakeBackend(), {"model": "claude-opus-5"})
+    coord = _FakeCoordinator({"computer": computer})
+    provider = _AnthropicProviderNoStream(default_model="claude-haiku-4-5-20251001")
+    hook_mod._wrap_provider(provider, coord, max_inline=3)
+
+    # Reset to the wrong value as if priming had not run, to isolate what
+    # complete() alone corrects.
+    computer._tool_version = "computer_20251124"
+    result = _run(provider.complete(_FakeRequest(model=None)))
+
+    assert result == "ok"
+    assert computer._tool_version == "computer_20250124"
+
+
+def test_wrapped_complete_prefers_an_explicit_request_model_override_over_default_model():
+    """When a caller DOES set a per-request override, it is more specific
+    than the provider-wide default and must win."""
+    computer = ComputerTool(_FakeBackend(), {"model": "claude-opus-5"})
+    coord = _FakeCoordinator({"computer": computer})
+    provider = _AnthropicProviderNoStream(default_model="claude-opus-5")
+    hook_mod._wrap_provider(provider, coord, max_inline=3)
+
+    request = _FakeRequest(model="claude-sonnet-4-5-20250929")
+    result = _run(provider.complete(request))
+
+    assert result == "ok"
+    assert computer._tool_version == "computer_20250124"
 
 
 def test_wrapped_complete_tolerates_a_coordinator_that_cannot_find_the_tool():

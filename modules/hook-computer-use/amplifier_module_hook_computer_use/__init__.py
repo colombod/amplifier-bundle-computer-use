@@ -649,23 +649,42 @@ def _expand_tool_results(messages: list[Any], max_inline: int) -> list[Any]:
 
 
 def _note_model_on_computer_tool(coordinator: Any, model: str | None) -> None:
-    """Forward the model about to receive THIS request to the mounted `computer`
+    """Forward the model about to receive a request to the mounted `computer`
     tool's `note_model()`, so `ComputerTool._tool_version` never drifts out of
-    sync with the model actually in use this turn (see `tool_versions.py`).
+    sync with the model actually in use (see `tool_versions.py`).
 
     This is Plan A1 (`docs/designs/phase2-plans.md`): `note_model()` existed with
     zero callers - both its own docstring and a comment in tool-computer-use's
     `__init__.py` asserted hook-computer-use already called it on every
-    `provider:request`. It never did. `request` (a `ChatRequest`) is the seam:
+    `provider:request`. It never did. `request` (a `ChatRequest`) is one seam:
     its `model` field is the standard, documented per-request model override
     (`amplifier_core.message_models.ChatRequest.model`) - the same field a model
     override, a role fallback, or a routing-matrix substitution would set before
     this request reaches the wire. In today's default loop-streaming flow this
-    field is commonly `None` (no per-request override in play); `note_model`
-    already handles that correctly by keeping whatever tool_version was
+    field is commonly `None` (no per-request override in play).
+
+    Issue #1 fixed two compounding gaps in how this gets called:
+
+    1. **Blind when `request.model` is `None`.** `_wrap_provider` now resolves
+       `getattr(request, "model", None) or getattr(provider, "default_model",
+       None)` before calling this - the provider's own configured model is the
+       fact actually in play whenever no per-request override exists, and
+       `request.model` alone left the corrector permanently blind for every
+       session that never sets an override (the common case).
+    2. **One turn late for a short-lived session.** `_wrap_provider` ALSO calls
+       this once, at wrap time (mount-priming), from `provider.default_model` -
+       BEFORE the orchestrator's first `native_tool_spec` read for this
+       session. `note_model` corrects `_tool_version` for the *next* read, not
+       retroactively; a long-lived parent survives being one turn behind, but
+       a short-lived sub-agent's first request is also its only one. Priming
+       at wrap time (which runs once per provider instance, before any
+       request) means the FIRST read is already correct.
+
+    Regardless of which call site invokes it, `note_model` already handles an
+    unresolvable model correctly by keeping whatever tool_version was
     previously resolved, per `tool_versions.resolve_tool_version`'s own
-    "unknown/unset model keeps previous" rule - so calling this every request,
-    unconditionally, is always safe, never just a no-op wart.
+    "unknown/unset model keeps previous" rule - so calling this unconditionally,
+    from either call site, is always safe, never just a no-op wart.
 
     Same defensive lookup shape `_make_gate_handler`/`_make_halt_notice_handler`
     already use below (`coordinator.get("tools", "computer")` guarded by a broad
@@ -741,13 +760,45 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
     if not hasattr(provider, "complete"):
         return False
 
+    # Prime `computer`'s resolved tool_version from this provider's
+    # EFFECTIVE model BEFORE the orchestrator's ToolSpec construction ever
+    # reads `native_tool_spec` for the first request of this session.
+    #
+    # Why this can't wait for the wrapped `complete()` below: `native_tool_spec`
+    # is read once per turn, by the orchestrator, *before* `provider.complete()`
+    # runs (`ComputerTool.native_tool_spec`'s own docstring; `note_model`'s
+    # docstring: "a correction here lands one turn ahead of the read it
+    # protects, not retroactively inside the same turn"). A long-lived parent
+    # session survives being one turn behind. A short-lived sub-agent does
+    # not: its first request is also its only chance, so the FIRST read must
+    # already be correct - which means resolving here, at wrap time (this
+    # function runs once per provider instance, gated by `_WRAPPED_FLAG`
+    # below), not only inside the per-request `complete()` wrapper.
+    #
+    # `getattr(provider, "default_model", None)` - not `ChatRequest.model` -
+    # is the right fact to prime from: `default_model` is the model this
+    # provider instance actually answers with when no per-request override is
+    # given, which is the common case (see `_note_model_on_computer_tool`'s
+    # docstring for why `request.model` is usually `None`).
+    _note_model_on_computer_tool(coordinator, getattr(provider, "default_model", None))
+
     original = provider.complete
 
     async def complete(request: Any, **kwargs: Any):
         # Plan A1 (docs/designs/phase2-plans.md): keep `computer`'s resolved
         # tool_version current for the model actually about to receive THIS
         # request - see `_note_model_on_computer_tool` for the full rationale.
-        _note_model_on_computer_tool(coordinator, getattr(request, "model", None))
+        #
+        # `request.model` is only the per-request OVERRIDE and is normally
+        # `None` (no override in play); the model that will actually answer
+        # this request is the provider's own `default_model`. Prefer the
+        # override when a caller set one (it is more specific than the
+        # provider-wide default), fall back to `default_model` otherwise -
+        # never leave the corrector blind just because no override was set.
+        _effective_model = getattr(request, "model", None) or getattr(
+            provider, "default_model", None
+        )
+        _note_model_on_computer_tool(coordinator, _effective_model)
         try:
             messages = getattr(request, "messages", None)
             if isinstance(messages, list):
