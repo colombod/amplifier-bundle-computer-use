@@ -114,6 +114,74 @@ _KEY_ALIASES = {
 }
 
 
+#: Timeout for the `systemctl --user show-environment` subprocess `probe()`
+#: shells out to below - generous for a purely local D-Bus round trip, tight
+#: enough that a hung/misbehaving systemd user manager cannot stall mount().
+_SESSION_DISPLAY_CHECK_TIMEOUT_S = 3.0
+
+
+def _reference_session_display(
+    timeout_s: float = _SESSION_DISPLAY_CHECK_TIMEOUT_S,
+) -> str | None:
+    """Best-effort lookup of the `DISPLAY` value THIS USER'S OWN systemd
+    `--user` manager has registered (`systemctl --user show-environment`) -
+    the value the display/session manager itself exported at login,
+    independent of whatever `DISPLAY` this specific process happens to have
+    inherited right now.
+
+    This is the ground truth `probe()` checks a blind
+    `os.environ.get(\"DISPLAY\")` pickup against (see `__init__`'s
+    `_display_explicit`). A real, healthy, XTEST-capable X server can still
+    be the WRONG one: a stray `Xvfb` left running from an earlier
+    `CONTRIBUTING.md` ship-gate session, with `DISPLAY` still exported in a
+    shell nobody closed, satisfies every other check in this file
+    identically to the user's real interactive desktop - and was observed
+    doing exactly that (alive 6+ days, `ppid=1`) on a real machine. Capture,
+    click, and type all "succeed" against the wrong display with zero
+    errors, which is exactly the reported symptom: "it says it did it, no
+    errors, but nothing happens on my desktop."
+
+    An **active-monitor-count (RandR) check was tried and rejected**: a
+    real, logged-in-but-headless desktop can legitimately report zero active
+    monitors while a stray `Xvfb` reports one active (fake) monitor - RandR
+    gets exactly backwards which one is "the user's session" on such a box.
+    `systemctl --user show-environment` does not have that failure mode: it
+    reports what the LOGIN session itself registered, not what any given X
+    server's virtual output happens to claim.
+
+    Returns `None` - "no reference available", not "mismatch" - whenever
+    there is nothing to compare against: no systemd user manager reachable
+    at all (`systemctl` missing, no per-user D-Bus session - a container or
+    a bare CI box with no systemd `--user` instance), or a reachable one
+    that has never exported a `DISPLAY` (a genuinely headless account with
+    no GUI login ever). Both are the honest, legitimate no-user-session case
+    this bundle explicitly still supports (CI, containers,
+    `scripts/verify_coexistence.py`'s own deliberate `Xvfb` target) - not an
+    error to paper over. Only a *known, differing* reference counts as a
+    mismatch; the caller decides what to do with `None`.
+    """
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # No systemd, no `systemctl` on PATH, no reachable user D-Bus, or it
+        # hung - all the same "no reference available" case to this caller.
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        if line.startswith("DISPLAY="):
+            value = line[len("DISPLAY=") :].strip()
+            return value or None
+    return None
+
+
 def _resolve_xauthority() -> str | None:
     """Find the Xauthority cookie file without assuming `~/.Xauthority`.
 
@@ -156,7 +224,20 @@ class LinuxX11Backend:
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         cfg = config or {}
-        self._display_name: str | None = cfg.get("display") or os.environ.get("DISPLAY")
+        explicit_display = cfg.get("display")
+        #: True when the caller named a display ON PURPOSE (an explicit
+        #: `config["display"]` - e.g. `scripts/verify_coexistence.py`'s own
+        #: `LinuxX11Backend({"display": ...})`, which always sets this).
+        #: False means `_display_name` fell back to a blind
+        #: `os.environ.get("DISPLAY")` pickup - the path `registry.py`'s
+        #: `select_backend()` takes for every real mount, and the one that
+        #: let a stray `Xvfb`'s leaked `DISPLAY` env var silently become
+        #: "the" desktop. `probe()` only runs the user-session match check
+        #: below when this is False - a deliberate, explicit target is
+        #: trusted as-is; that is the caller's call, not this backend's to
+        #: second-guess.
+        self._display_explicit: bool = bool(explicit_display)
+        self._display_name: str | None = explicit_display or os.environ.get("DISPLAY")
         self._display: Any = None  # Xlib.display.Display, set once probe() succeeds
         self._root: Any = None
         # Cached result of `_check_discrete_input_available()` - see that method for
@@ -182,6 +263,31 @@ class LinuxX11Backend:
             )
         if not self._display_name:
             return ProbeResult(False, "no DISPLAY set; no local X11 session to talk to")
+        # User-session match check - only for a BLIND env pickup (see
+        # `__init__`'s `_display_explicit`). A caller that named `display`
+        # explicitly (e.g. `scripts/verify_coexistence.py`'s deliberate
+        # `Xvfb` target) is trusted as-is and skips this entirely; this only
+        # guards the path `registry.select_backend()` actually takes at a
+        # real mount, where nothing but `os.environ.get("DISPLAY")` ever
+        # named this display. See `_reference_session_display`'s docstring
+        # for the defect this closes and the RandR approach it replaces.
+        if not self._display_explicit:
+            reference = _reference_session_display()
+            if reference is not None and reference != self._display_name:
+                return ProbeResult(
+                    False,
+                    f"DISPLAY={self._display_name!r} (picked up from this "
+                    "process's environment) does not match the display "
+                    f"this user's own login session has registered "
+                    f"({reference!r}, from `systemctl --user "
+                    "show-environment`); refusing to drive a desktop that "
+                    "may not be the one actually being used interactively. "
+                    "A leaked DISPLAY env var from an earlier Xvfb/test "
+                    "session is the common cause - see CONTRIBUTING.md's "
+                    "ship-gate instructions. Set tool config 'display' "
+                    "explicitly if you intend to target this X server on "
+                    "purpose.",
+                )
         xauth = _resolve_xauthority()
         if xauth and not os.environ.get("XAUTHORITY"):
             os.environ["XAUTHORITY"] = xauth

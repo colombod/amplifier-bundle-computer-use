@@ -293,12 +293,25 @@ Privacy pane lists after the first attempted action).
 |---|---|---|
 | `python-xlib` installed **in the running interpreter** | `probe()` | `python-xlib is not installed in the running interpreter (...); this backend cannot drive X11 without it` |
 | `DISPLAY` set | `probe()` | `no DISPLAY set; no local X11 session to talk to` |
+| **`DISPLAY` matches this user's own login session** (only when `DISPLAY` was picked up blindly from the environment, not set via explicit tool config `display`) | `probe()` | `DISPLAY=':99' (picked up from this process's environment) does not match the display this user's own login session has registered (':1', from systemctl --user show-environment); ...` |
 | X server connectable | `probe()` | `cannot connect to X server ':0': ...` |
 | XTEST extension present | `probe()` | `X server does not support the XTEST extension` |
 
 The `python-xlib` message is deliberate: this used to surface as `'NoneType' object has no
 attribute 'Display'`, which reads like an X connection fault and sends you looking at
 `DISPLAY`/`xhost` instead of at the missing package.
+
+**The session-match check exists because a healthy, reachable, XTEST-capable X server can
+still be the *wrong* one.** A stray `Xvfb` left running from an earlier ship-gate session
+(see `CONTRIBUTING.md`) satisfies every other check above identically to the real desktop
+- `probe()` used to accept it, and every action would then "succeed" against a display
+nobody is looking at, with zero errors. The check compares a blindly-picked-up `DISPLAY`
+against `systemctl --user show-environment`'s own record of this user's session; it is
+skipped entirely when `config.display` is set explicitly (a deliberate target, such as
+`scripts/verify_coexistence.py`'s own `Xvfb`, is trusted as named). On a headless CI box or
+a container with no systemd `--user` session at all, there is nothing to compare against,
+so the blindly-picked-up `DISPLAY` is still trusted - this is the legitimate no-session
+case, not the accidental one.
 
 `XAUTHORITY` is resolved and set if absent (`~/.Xauthority`, then
 `/run/user/<uid>/gdm/Xauthority`, then `/run/user/<uid>/.mutter-Xwaylandauth`).

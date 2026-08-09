@@ -75,8 +75,19 @@ It needs a real (if headless) X server:
 
 ```bash
 Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &
+XVFB_PID=$!
+trap 'kill "$XVFB_PID" 2>/dev/null' EXIT
 DISPLAY=:99 .venv/bin/python scripts/verify_coexistence.py
 ```
+
+**Kill the `Xvfb` you started — the `trap` above does this for you.** A backgrounded
+`Xvfb` with no cleanup is easy to forget, and a forgotten one does not just waste a
+process slot: `DISPLAY=:99` can leak into a later shell (a sourced rc file, a tmux pane,
+an inherited environment), and `LinuxX11Backend.probe()` used to accept *any* reachable,
+XTEST-capable X server as "the" desktop — including a stray `Xvfb` left running for days.
+`probe()` now checks a blindly-picked-up `DISPLAY` against this user's own login session
+(`systemctl --user show-environment`) before trusting it, but there is still no reason to
+leave the test server running — kill it when you are done.
 
 This takes several minutes (dozens to ~100+ real trials, each a real subprocess spawn) and
 is **not** run in CI — CI runs headless with no display server at all. Run it locally,
