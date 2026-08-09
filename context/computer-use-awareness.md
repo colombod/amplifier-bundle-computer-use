@@ -1,15 +1,21 @@
-# Computer Use (Windows desktop)
+# Computer Use (real desktop control)
 
-This session can see and control the real Windows desktop through Claude's native
-computer-use tool, named `computer`. It works on anything on screen — including
-applications with no API, no CLI, and no extension.
+This session can see and control a real desktop — Windows, macOS, or Linux, local or
+reachable over your private network — through the LLM provider's native computer-use
+tool, named `computer`. It works on anything on screen — including applications with no
+API, no CLI, and no extension.
 
 **Delegate desktop work to `computer-use:computer-operator`.** It carries the operating
 rules for driving a live machine safely.
 
 Use it whenever the user asks what is on their screen, asks you to click, type, drag,
-scroll, or open something in a Windows application, or hits a task that cannot be done
+scroll, or open something in a desktop application, or hits a task that cannot be done
 through an API.
+
+**This capability is not always present.** If `computer_use_unavailable` appears in your
+tool list instead of `computer`/`desktop`, no backend was available for this session —
+relay that tool's explanation to the user and stop; do not improvise a workaround (e.g.
+driving a remote machine over a shell tool).
 
 The screen is captured, downscaled, and handed to the model as an image; coordinates the
 model emits are scaled back to physical pixels automatically. Never guess coordinates —

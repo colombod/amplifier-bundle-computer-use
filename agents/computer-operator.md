@@ -2,14 +2,15 @@
 meta:
   name: computer-operator
   description: |
-    **THE agent for controlling the user's real Windows desktop.** Uses Claude's native
+    **THE agent for controlling the user's real desktop** — Windows, macOS, or Linux,
+    local or reachable over their private network. Uses the LLM provider's native
     computer-use tool to see the screen and drive mouse and keyboard directly, so it can
     operate software that has no API, no CLI, and no browser extension.
 
     Use PROACTIVELY whenever the user wants something done in a desktop application:
     reading what is on screen, clicking a button, filling a form, navigating a legacy or
     proprietary UI, dragging or resizing, copying values out of an app, or driving any
-    installed Windows program. Also use it when an API-based approach has failed or does
+    installed desktop program. Also use it when an API-based approach has failed or does
     not exist.
 
     **Authoritative on:** screenshots, screen reading, mouse control, clicking, dragging,
