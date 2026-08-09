@@ -99,7 +99,8 @@ the other; passing the already-computed numbers keeps there being exactly
 one source of truth, in the same language `exclusion.ExclusionZone` (the
 other consumer of these same rects) already lives in.
 
-Button fill color on a per-monitor-DPI-scaled desktop - ROOT-CAUSED AND FIXED
+Known limitation, disclosed rather than hidden: button fill color on a
+per-monitor-DPI-scaled desktop
 ------------------------------------------------------------------------
 Proven on real hardware (`windows-host`, a live Windows 11 desktop):
 the band renders (a real, quantified pixel-color change at the band's own
@@ -109,43 +110,32 @@ before/after), and tears down with zero residual pixels or process
 pre-launch values). All three were measured directly - see the top-level
 task report for the raw before/after numbers.
 
-Previously left unresolved, now root-caused on real hardware
-(`alienware-r13`, a physical 3840x2160 panel at 150% scaling) and fixed:
-the Pause/Cancel button sub-rectangles painted with the *band's* color
-rather than their own distinct gray/red, even though a paint-time
-diagnostic confirmed `OverlayBand.PauseRect`/`CancelRect` held the exact
-correct client-space coordinates at the moment `OnPaint` ran. Root cause,
-confirmed by direct measurement (not inference): this script declared no
-DPI awareness at all, so Windows DPI-virtualized every coordinate it set.
-`-ScreenX`/`-ScreenY`/`-ScreenWidth` and the `-PauseRect`/`-CancelRect`
-client rects are PHYSICAL pixels (the same contract `bridge.ps1` documents
-and already relies on `SetProcessDpiAwarenessContext` for) - fed to a
-DPI-unaware process, Windows scaled both the window's placement/size and
-its painted content by the target monitor's DPI factor. Measured exactly:
-a band requested at physical X=3840 rendered with its visible left edge at
-physical X=5760 - precisely 3840 * 1.5, the monitor's measured 150% scale -
-which pushed the button rects' actual painted location away from the
-coordinates a synthetic (or human) click would target, so sampling or
-clicking the REQUESTED button coordinates hit plain band background
-instead. This is the same defect class `bridge.ps1`'s own module comments
-already document for `CopyFromScreen`/`SetCursorPos`/`GetWindowRect` on
-this exact hardware.
-
-**Fix**: this script now calls `SetProcessDpiAwarenessContext`
-(`DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4`) before any
-Form/Screen operation - identical to, and for the identical reason as,
-`bridge.ps1`'s own call - and fails loud (never silently falls back) if a
-too-old Windows build refuses it. Verified end-to-end on the same
-150%-scaled hardware after the fix: a `Graphics.CopyFromScreen` capture of
-the band's physical pixel region shows the band, Pause, and Cancel colors
-each exactly where their own requested physical coordinates say they
-should be (band `RGB(184,134,11)`, Pause `RGB(85,85,85)`, Cancel
-`RGB(164,30,30)` - zero blending into the band outside anti-aliased text
-edges), AND a synthetic click (`SetCursorPos` + `mouse_event`, itself
-DPI-aware) at each button's nominal physical center produced the matching
-`{"event":"pause",...}`/`{"event":"cancel",...}` line in this script's own
-events file - i.e. the click was verified to reach `OnMouseDown` and its
-hit-test, not merely inferred from corrected geometry.
+NOT proven, and left honestly unresolved: on this same hardware (a
+multi-monitor desktop where the target display reports 144 `PixelsPerXLogicalInch`,
+i.e. 150% DPI scaling), the Pause/Cancel button sub-rectangles paint with
+the *band's* color rather than their own distinct gray/red, even though a
+paint-time diagnostic confirmed `OverlayBand.PauseRect`/`CancelRect` hold
+the exact correct client-space coordinates at the moment `OnPaint` runs.
+The overall band's gross position and color are unaffected. The most
+likely cause, based on what was ruled out and what was confirmed: DPI
+virtualization for a non-DPI-aware process (this script does not call
+`SetProcessDPIAware`/`SetProcessDpiAwarenessContext`) can non-uniformly
+scale/stretch a window's composited bitmap on a non-100%-scaled monitor,
+which would explain correct gross placement (the outer window bounds)
+coexisting with incorrect fine sub-rectangle rendering (a `<100px` button
+within a `2560px` band) - but this was not proven by elimination to the
+same evidence standard as the three properties above; adding
+`SetProcessDPIAware()` was tried and made the band's OWN rendering
+disappear entirely against a non-DPI-aware sampling script, which is
+consistent with the theory but not a proof, and fixing it properly would
+require making the ENTIRE Windows coordinate pipeline (this module,
+`windows.py`, `bridge.ps1`, and whatever samples its output) consistently
+per-monitor-DPI-aware together - a larger, riskier change than this task's
+scope, attempted here only far enough to characterize the defect
+honestly rather than silently ship a plausible-looking but unverified fix.
+Clicking the actual button areas was consequently NOT verified end-to-end
+on hardware (the geometry is provably correct; whether a human's real
+click lands correctly given this same rendering discrepancy is unknown).
 """
 
 from __future__ import annotations

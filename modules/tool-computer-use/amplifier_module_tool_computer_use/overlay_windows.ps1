@@ -91,46 +91,6 @@ $OutputEncoding = New-Object System.Text.UTF8Encoding $false
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
-# Defect fix (docs/designs/coexistence.md \u00a77.1): this process was not declaring
-# ANY DPI awareness, so on a per-monitor-DPI-scaled desktop Windows DPI-virtualized
-# every coordinate this script set - `-ScreenX`/`-ScreenY`/`-ScreenWidth` and the
-# `-PauseRect`/`-CancelRect` client rects are PHYSICAL pixels (`bridge.ps1` - which
-# already sets this same awareness level - documents that contract: "All
-# coordinates are PHYSICAL screen pixels of the virtual desktop"), but an unaware
-# process's window bounds and painted content both get scaled by the target
-# monitor's DPI factor before reaching the screen. Measured directly on real
-# hardware (`alienware-r13`, a physical 3840x2160 panel at 150% scaling): a band
-# requested at physical X=3840 rendered with its visible left edge at physical
-# X=5760 - exactly 3840 * 1.5 - and the Pause/Cancel button rects, computed from
-# the same physical coordinates as the band, ended up outside where a human (or
-# a synthetic click) would look for them; sampling their nominal coordinates read
-# plain band-background color, matching this file's previously-undiagnosed
-# "buttons paint with the band's colour" defect exactly. Setting Per-Monitor-v2
-# awareness (`DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4`) - identical to
-# `bridge.ps1`'s own call, and for the identical reason - makes every coordinate
-# this script uses (Form.Bounds, the painted PauseRect/CancelRect, and
-# OnMouseDown's `e.Location` hit-testing) a literal 1:1 physical pixel, matching
-# what `bridge.ps1`/`windows.py` already compute. Fails loud rather than silently
-# falling back to the DPI-broken legacy behavior, mirroring `bridge.ps1`'s own
-# refusal on a build too old to support it (pre-Creators-Update, 1703).
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public static class CUOverlayDpi {
-    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
-}
-"@
-if (-not [CUOverlayDpi]::SetProcessDpiAwarenessContext([IntPtr]-4)) {
-  throw ("DPI_AWARENESS_FAILED: SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) " +
-    "was refused by this Windows build. The coexistence overlay's geometry (band " +
-    "bounds, Pause/Cancel button rects) is computed in physical pixels and cannot " +
-    "be guaranteed correct on a per-monitor-DPI-scaled desktop without per-monitor " +
-    "DPI awareness (requires the Windows 10 Creators Update, 1703, or later) - " +
-    "refusing to show a disclosure control that may be mis-scaled or unclickable " +
-    "rather than risk an unreachable stop button (docs/designs/coexistence.md " +
-    "\u00a77.1).")
-}
-
 $eventsDir = Join-Path $env:TEMP 'amplifier-computer-use'
 New-Item -ItemType Directory -Force -Path $eventsDir | Out-Null
 $eventsFile = Join-Path $eventsDir 'overlay-events.ndjson'

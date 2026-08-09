@@ -2073,20 +2073,11 @@ def _build_coexistence_guard(
     guarantee you do not have" principle \u00a75.5 applies to Windows `type_text`.
 
     `cfg["coexistence"]` (all keys optional):
-      - `enabled`: **no longer controls whether this guard is built.**
-        Defect fix (see `docs/designs/coexistence.md` \u00a76.0/C1 item 6): this
-        key used to make `enabled: False` return `None` here, which silently
-        removed the halt invariant, pause, target binding, and geometric
-        exclusion in one boolean, at `logger.info`, with no consumer
-        anywhere ever noticing. That directly contradicted \u00a76.0 ("no
-        configuration key disables [the halt]") and made C1's acceptance
-        item 6 false. Whenever a backend structurally supports presence
-        detection (the two checks below), this guard is now built
-        unconditionally - no config key of any kind can prevent that.
-        `enabled` is not deleted: it keeps a real, narrower effect - see
-        `_disclosure_decline_reason` - as an alias of `announce` for
-        declining session-start *disclosure only*, gated by a mount-time
-        presence check (`_refuse_if_disclosure_declined_with_human_present`).
+      - `enabled` (default `True` when the backend supports it): set `False`
+        to opt out of building the layer entirely for this session. This is
+        NOT the \u00a76.0 halt-invariant opt-out - once a guard exists, nothing
+        in its config can disable the halt (see `coexistence_guard.py`
+        module docstring). This key only controls whether one exists.
       - `drive_anyway` (default `False`, \u00a77.6/D5): permits *beginning* to
         drive when a human is already detected present at guard-construction
         time. Logged when it fires. Never affects the halt invariant.
@@ -2094,6 +2085,13 @@ def _build_coexistence_guard(
     coexistence_cfg = dict(cfg.get("coexistence") or {})
     idle_source = getattr(backend, "presence_idle_ms", None)
     if idle_source is None:
+        return None
+    if not bool(coexistence_cfg.get("enabled", True)):
+        logger.info(
+            "coexistence: disabled by config for backend %r - no presence "
+            "detector, halt invariant, or target binding this session",
+            backend.name,
+        )
         return None
     # Coverage-gap fix: `backend.name` is the right key for LOCAL backends
     # ("linux-x11", "macos", "windows-wsl2" - each IS its own GUARD_MS
@@ -2521,78 +2519,6 @@ def _get_channel_band_state(channel_key: str) -> _ChannelBandState:
         return state
 
 
-def _disclosure_decline_reason(coexistence_cfg: dict[str, Any]) -> str | None:
-    """Which config key, if any, declined session-start disclosure for this
-    session (docs/designs/coexistence.md \u00a77.6) - `announce` (the
-    disclosure-specific key) or the legacy `enabled`.
-
-    `enabled` used to ALSO skip building the halt invariant, pause, target
-    binding, and exclusion (`_build_coexistence_guard`'s old behavior - see
-    that function's docstring for the defect this closed). It no longer can:
-    that guard is now unconditional wherever a backend supports presence
-    detection. What `enabled: False` can still legitimately do - decline
-    disclosure only, on the SAME gated terms `announce` already uses - is
-    preserved here rather than deleted, so an operator's existing config
-    keeps a real (if narrower) effect instead of silently doing nothing or
-    erroring outright. Both keys are read; either being `False` declines.
-    Returns the key name (for log lines / refusal messages), or `None` if
-    disclosure was not declined.
-    """
-    if not bool(coexistence_cfg.get("announce", True)):
-        return "announce"
-    if not bool(coexistence_cfg.get("enabled", True)):
-        return "enabled"
-    return None
-
-
-def _refuse_if_disclosure_declined_with_human_present(
-    coexistence_cfg: dict[str, Any], guard: CoexistenceGuard | None, backend: Backend
-) -> str | None:
-    """mount()-time counterpart to `_build_announcement`'s `announce`/
-    `enabled` handling (\u00a77.6) - closes the defect where a declined
-    disclosure surfaced only as an ordinary-looking
-    `ToolResult(success=False)` on whatever action happened to run first
-    (`_ensure_announced` only fires on this session's FIRST REAL ACTION, not
-    `mount()` - see that method's docstring for why), indistinguishable from
-    any other recoverable tool error.
-
-    Performs the exact same \u00a77.6 judgement (human detected + no working
-    disclosure -> refuse) here, at mount, with a single side-effect-free
-    presence sample: no dialog shown, no overlay built, no consent asked,
-    nothing `_ensure_announced`/`_build_announcement` themselves do. Returns
-    a refusal reason for `mount()` to hand to `_mount_unavailable`, or `None`
-    to mount normally - `_build_announcement`'s own \u00a77.6 policy still runs
-    again, unchanged, at first use; this only closes the "silent until first
-    action" gap, it does not replace that gate.
-    """
-    declined_by = _disclosure_decline_reason(coexistence_cfg)
-    if declined_by is None:
-        return None
-    if guard is None:
-        # No presence detector for this backend at all (\u00a75.5) - nothing to
-        # sample. `_build_announcement` hits its own `guard is None` branch
-        # later and logs the same combination; nothing new to refuse here.
-        return None
-    try:
-        snap = guard.presence.sample()
-        human_present = snap.state is PresenceState.HUMAN_ACTIVE
-    except IdleUnreadableError:
-        # \u00a79.6 fail-safe: unreadable idle is treated as present, exactly
-        # like `_handle_channel_failure`'s identical fallback.
-        human_present = True
-    if not human_present:
-        return None
-    return (
-        f"coexistence.{declined_by} declined session-start disclosure and a "
-        f"human is currently detected at backend {backend.name!r} - "
-        "refusing to mount rather than drive with no disclosure channel "
-        "and someone present (docs/designs/coexistence.md \u00a77.6). The halt "
-        "invariant (\u00a76.0) is never affected by this key. If this is "
-        "intentional, use coexistence.drive_anyway instead - logged every "
-        "session, and it does not silently remove disclosure either."
-    )
-
-
 def _build_announcement(
     backend: Backend,
     guard: CoexistenceGuard | None,
@@ -2617,12 +2543,9 @@ def _build_announcement(
     policy knobs.
     """
     coexistence_cfg = dict(cfg.get("coexistence") or {})
-    declined_by = _disclosure_decline_reason(coexistence_cfg)
-    if declined_by is not None:
+    if not bool(coexistence_cfg.get("announce", True)):
         logger.info(
-            "coexistence: announcement disabled by config (coexistence.%s) "
-            "for backend %r",
-            declined_by,
+            "coexistence: announcement disabled by config for backend %r",
             backend.name,
         )
         return None
@@ -3057,28 +2980,6 @@ async def mount(
         computer._channel_key = _channel_identity(backend)
         computer._ledger = _get_channel_ledger(computer._channel_key)
         computer._band_state = _get_channel_band_state(computer._channel_key)
-    # Defect fix (docs/designs/coexistence.md §7.6): `coexistence.announce`/
-    # `coexistence.enabled` declining disclosure used to surface only as an
-    # ordinary-looking `ToolResult(success=False)` on this session's first
-    # real action (`_ensure_announced` fires there, not here - see the big
-    # comment a few lines down for why). Check here, at mount, with a single
-    # side-effect-free presence sample: refuse to mount outright when a
-    # human is already detected present with no disclosure channel, exactly
-    # as loud and exactly as early as `NoBackendAvailable` already is below.
-    mount_coexistence_cfg = dict(cfg.get("coexistence") or {})
-    disclosure_refusal = _refuse_if_disclosure_declined_with_human_present(
-        mount_coexistence_cfg, computer._coexistence_guard, backend
-    )
-    if disclosure_refusal is not None:
-        try:
-            backend.close()
-        except Exception:  # noqa: BLE001 - best-effort cleanup on refusal
-            logger.debug(
-                "tool-computer-use: backend.close() failed after a "
-                "mount-time disclosure refusal",
-                exc_info=True,
-            )
-        return await _mount_unavailable(coordinator, disclosure_refusal)
     # Session-start disclosure (docs/designs/coexistence.md §7) - the
     # Linux/Windows overlay or the macOS announce-and-acknowledge dialog,
     # whichever this backend supports - is deliberately NOT built here.

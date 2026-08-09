@@ -404,8 +404,7 @@ aspirations. `behaviors/computer-use.yaml` ships a minimal subset.
 | `target_monitor` | `"primary"` | A monitor id, `"primary"`, or `monitors.VIRTUAL_DESKTOP` for the whole bounding box |
 | `clipboard_read_policy` | `allow` local / `redact` remote | `allow` \| `redact` \| `block` |
 | `type_pacing_ms` | *(auto)* | Inter-character delay. Auto = wide enough to keep the presence guard unmasked when one is active; `0` forces full speed (logged at WARNING) |
-| `coexistence.enabled` | `true` | **Legacy alias of `coexistence.announce`** (declines session-start disclosure only). No longer affects whether the halt/pause/target-binding/exclusion guard is built - that guard is unconditional whenever the backend supports presence detection. Setting `false` refuses to *mount* if a human is currently detected present (logged, `docs/designs/coexistence.md` §7.6); proceeds without disclosure, loudly, if nobody is |
-| `coexistence.announce` | `true` | Decline session-start disclosure only. Same gated behavior as `enabled` above - never affects the halt invariant |
+| `coexistence.enabled` | `true` | Whether a guard is built at all. **Does not** disable the halt once one exists |
 | `coexistence.drive_anyway` | `false` | Permit *beginning* to drive when a human is already detected present. Logged |
 | `powershell_path` | *(auto)* | Windows backend override |
 | `ssh_path` | `"ssh"` | Remote only |
