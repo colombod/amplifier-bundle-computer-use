@@ -643,5 +643,5 @@ It permits driving to *begin* on a target with a human present and no working an
 ### Confirmed closed, not for decision
 
 - **Resident macOS LaunchAgent** — O1 removed its reason to exist. Closed unless D2 goes the other way.
-- **Agent-drawn macOS overlay** — O2 tested it directly. Settled negative. Stop probing.
+- **Agent-drawn macOS overlay** — O2 tested it directly. Settled negative. Stop probing. — **DISPUTED: `docs/designs/disclosure-v2.md` §5 reports probes that overturn O2 (its negative was a race, not a wall). Read that before relying on this line.**
 - **`GUARD = 250 ms`** — O5 proved it disables the feature during exactly the operation the incident occurred in. Replaced by a per-platform band, 5 ms on Linux, measured elsewhere.
