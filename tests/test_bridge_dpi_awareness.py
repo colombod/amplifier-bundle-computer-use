@@ -5,7 +5,7 @@ CI-side only: no Windows target, no PowerShell, no subprocess spawned - this
 is a source-text assertion, following the same established pattern as
 `test_overlay_windows.py` for Windows-only code this suite cannot execute.
 Real-hardware proof lives in the accompanying investigation report (a real
-four-monitor Win11 desktop reached over SSH, `brkrabac@alienware-r13`), not
+four-monitor Win11 desktop reached over SSH, `a-user@example-desktop`), not
 here - matching `CONTRIBUTING.md`'s "ship gate" precedent for platform code
 with no CI-side Windows box available.
 

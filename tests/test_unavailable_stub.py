@@ -230,8 +230,8 @@ async def test_discover_is_read_only_and_never_touches_the_coordinator(
 @pytest.mark.asyncio
 async def test_discover_never_asserts_tailscale_owner_as_ssh_user(monkeypatch):
     """The real ambiguity this was built for: a tailnet reports node owner
-    'bkrabach@github' while the actual working ssh user for that same host
-    is 'brkrabac' - discover must report the tailscale candidate with
+    'alice@github' while the actual working ssh user for that same host
+    is 'a-user' - discover must report the tailscale candidate with
     user=None/ambiguous_user=True rather than guessing the owner is the
     login name."""
     import amplifier_module_tool_computer_use as cu
@@ -239,15 +239,15 @@ async def test_discover_never_asserts_tailscale_owner_as_ssh_user(monkeypatch):
     fake_status = {
         "Peer": {
             "nodekey:abc": {
-                "HostName": "brians-macbook-pro-os",
-                "DNSName": "brians-macbook-pro-os.tail8f3c4e.ts.net.",
+                "HostName": "example-macbook",
+                "DNSName": "example-macbook.tail8f3c4e.ts.net.",
                 "TailscaleIPs": ["100.91.24.67"],
                 "UserID": 1,
                 "Online": True,
                 "OS": "macOS",
             }
         },
-        "User": {"1": {"LoginName": "bkrabach@github"}},
+        "User": {"1": {"LoginName": "alice@github"}},
     }
 
     class _FakeCompletedProcess:
@@ -264,8 +264,8 @@ async def test_discover_never_asserts_tailscale_owner_as_ssh_user(monkeypatch):
 
     payload = json.loads(result.output)
     ts_candidate = next(c for c in payload["candidates"] if c["source"] == "tailscale")
-    assert ts_candidate["hostname"] == "brians-macbook-pro-os"
-    assert ts_candidate["tailscale_owner"] == "bkrabach@github"
+    assert ts_candidate["hostname"] == "example-macbook"
+    assert ts_candidate["tailscale_owner"] == "alice@github"
     assert ts_candidate["user"] is None
     assert ts_candidate["ambiguous_user"] is True
 
@@ -354,7 +354,7 @@ async def test_persist_writes_only_the_target_key_and_preserves_everything_else(
     import amplifier_module_tool_computer_use as cu
 
     result = cu._persist_target(  # noqa: SLF001 - testing the module fn directly
-        "ssh://brkrabac@brians-macbook-pro-os", settings_path=settings_path
+        "ssh://a-user@example-macbook", settings_path=settings_path
     )
 
     assert result.success is True
@@ -373,7 +373,7 @@ async def test_persist_writes_only_the_target_key_and_preserves_everything_else(
     assert tool_entries == [
         {
             "module": "tool-computer-use",
-            "config": {"target": "ssh://brkrabac@brians-macbook-pro-os"},
+            "config": {"target": "ssh://a-user@example-macbook"},
         }
     ]
 

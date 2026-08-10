@@ -260,7 +260,7 @@ confirm the white overlay box instead showed it obscured — pixel-sampled at
 `(29,29,29)` (dark grey) across the entire expected `(50–350, 50–130)`
 rectangle, not white. Root cause: a **stale GNOME polkit authentication
 prompt** was live on that display (`ps` showed
-`/usr/lib/polkit-1/polkit-agent-helper-1 bkrabach` running since 09:59, hours
+`/usr/lib/polkit-1/polkit-agent-helper-1 alice` running since 09:59, hours
 before this probe). `query_tree` confirmed our window was mapped and was
 **last in stacking order (topmost among ordinary client windows)** — yet it
 still wasn't visible. This means: **a GNOME-Shell-composited modal (polkit

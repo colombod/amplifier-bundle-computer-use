@@ -158,7 +158,7 @@ def test_reference_session_display_parses_real_display_line(monkeypatch):
 
     class _Result:
         returncode = 0
-        stdout = "HOME=/home/bkrabach\nDISPLAY=:1\nXDG_RUNTIME_DIR=/run/user/1000\n"
+        stdout = "HOME=/home/alice\nDISPLAY=:1\nXDG_RUNTIME_DIR=/run/user/1000\n"
 
     monkeypatch.setattr(linux_x11.subprocess, "run", lambda *a, **kw: _Result())
 

@@ -73,7 +73,7 @@ def test_second_mount_for_the_same_host_does_not_reask_after_continue():
     for the same remote macOS target called `announce_raise` again, showing
     a genuinely second dialog - even though the first was already answered
     'Continue'."""
-    parent_backend = _FakeRemoteBackend("macos", user_host="user@alienware-r13")
+    parent_backend = _FakeRemoteBackend("macos", user_host="user@example-desktop")
     parent_backend._raise_result = {"button": "Continue", "gave_up": False}
     cu._build_announcement(parent_backend, _guard("macos"), {}, _DISPLAY)
     assert len(parent_backend.announce_calls) == 1
@@ -81,7 +81,7 @@ def test_second_mount_for_the_same_host_does_not_reask_after_continue():
     # A delegated child session mounts a SEPARATE ComputerTool/backend
     # instance for the SAME host - exactly what `tool-delegate` inheriting
     # the parent's `target:` config produces.
-    child_backend = _FakeRemoteBackend("macos", user_host="user@alienware-r13")
+    child_backend = _FakeRemoteBackend("macos", user_host="user@example-desktop")
     child_backend._raise_result = {"button": "Pause", "gave_up": False}  # ignored
     result = cu._build_announcement(child_backend, _guard("macos"), {}, _DISPLAY)
 
@@ -99,7 +99,7 @@ def test_second_mount_for_the_same_host_reuses_a_refusal_without_reasking():
     stay declined for every later mount() against the same host too -
     re-asking after a human already said no is the exact anti-pattern this
     fix exists to close."""
-    parent_backend = _FakeRemoteBackend("macos", user_host="user@alienware-r13")
+    parent_backend = _FakeRemoteBackend("macos", user_host="user@example-desktop")
     parent_backend._raise_result = {"button": "Pause", "gave_up": False}
     try:
         cu._build_announcement(parent_backend, _guard("macos"), {}, _DISPLAY)
@@ -108,7 +108,7 @@ def test_second_mount_for_the_same_host_reuses_a_refusal_without_reasking():
         raised = True
     assert raised
 
-    child_backend = _FakeRemoteBackend("macos", user_host="user@alienware-r13")
+    child_backend = _FakeRemoteBackend("macos", user_host="user@example-desktop")
     child_backend._raise_result = {
         "button": "Continue",
         "gave_up": False,
@@ -165,8 +165,8 @@ def test_local_backends_are_deduped_by_backend_name():
 
 
 def test_remote_channel_key_uses_user_host_not_the_composite_name():
-    backend = _FakeRemoteBackend("macos", user_host="brkrabac@brians-macbook-pro-os")
-    assert cu._channel_identity(backend) == "remote:brkrabac@brians-macbook-pro-os"
+    backend = _FakeRemoteBackend("macos", user_host="a-user@example-macbook")
+    assert cu._channel_identity(backend) == "remote:a-user@example-macbook"
 
 
 def test_remote_channel_key_falls_back_to_name_if_user_host_absent():

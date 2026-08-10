@@ -336,7 +336,7 @@ Discovery is judgement — chiefly the judgement in §7.3 about when to stop and
 
 ### 7.3 The username rule — the user's own trap this week
 
-Their tailnet showed `bkrabach@` as device owner. The working SSH user was `brkrabac`.
+Their tailnet showed `alice@` as device owner. The working SSH user was `a-user`.
 
 > **A tailnet or LAN listing gives you HOSTS. It never gives you USERS.**
 > The Tailscale owner field is an account identity — an email or SSO login — not a POSIX username on that machine. Deriving one from the other is the guess that fails.
@@ -345,8 +345,8 @@ Rules that follow, and they are absolute:
 
 1. **Never synthesize a username** from an owner field, an email local-part, the local `$USER`, or a hostname.
 2. `~/.ssh/config` `User` for that host is the **only** inferred source, because a human wrote it.
-3. If there is no `User` entry: **ask.** One question — *"what username do you log in as on `brians-macbook-pro`?"* — beats a failed connect that produces an authentication error a non-technical user cannot read.
-4. When asking, **offer the hosts you found**, not a guess at the full target. "I can see `brians-macbook-pro` and `alienware-r13` on your tailnet. Which one, and what's your username there?" is one question that closes both unknowns.
+3. If there is no `User` entry: **ask.** One question — *"what username do you log in as on `example-macbook`?"* — beats a failed connect that produces an authentication error a non-technical user cannot read.
+4. When asking, **offer the hosts you found**, not a guess at the full target. "I can see `example-macbook` and `example-desktop` on your tailnet. Which one, and what's your username there?" is one question that closes both unknowns.
 
 **Discovery that asks is better than discovery that guesses** — because the failure mode of guessing is not "it doesn't work," it is *"it doesn't work and the user cannot tell why."*
 
@@ -374,23 +374,23 @@ Each step names who acts. **Bold = a human must do something.**
 
 **1. Agent orients — `doctor` on the current binding.** Reports: bound to `local:linux-x11`, no target configured. So the MacBook is not reachable from this session yet.
 
-**2. Agent enumerates (rung 1).** `tailscale status --json` → `brians-macbook-pro-os` (macOS, online).
+**2. Agent enumerates (rung 1).** `tailscale status --json` → `example-macbook` (macOS, online).
 
 **3. Agent checks for a username (rung 2).** `~/.ssh/config` has no `User` for that host.
 
 **4. → HUMAN: answer one question.** Agent asks:
-> *"I can see `brians-macbook-pro-os` on your tailnet. What username do you log in with on that Mac? (I don't want to guess — the Tailscale owner name and the login name are often different.)"*
+> *"I can see `example-macbook` on your tailnet. What username do you log in with on that Mac? (I don't want to guess — the Tailscale owner name and the login name are often different.)"*
 
 This is the §7.3 step. It exists because guessing here cost this user real time this week.
 
 **5. Agent sets expectations *before* anything happens.** This is the "warn before the dialog" beat, and it must come *before* step 6, not after it fails:
-> *"I'm going to connect to `brkrabac@brians-macbook-pro-os` and take over that Mac's screen and keyboard. Three things will happen there, in this order:*
+> *"I'm going to connect to `a-user@example-macbook` and take over that Mac's screen and keyboard. Three things will happen there, in this order:*
 > *1. A dialog will appear on that Mac saying an automated agent is about to drive it, with **Allow** / **Don't allow**. It closes itself after 30 seconds. **Someone has to click Allow.***
 > *2. macOS may then say the process isn't allowed to record the screen or control the computer. Those are two separate permissions in two separate panes. I'll tell you exactly which process to enable when I see which one it asks for.*
 > *3. Once those are granted, I can see and drive it.*
 > *Is someone at that Mac right now?"*
 
-**6. → HUMAN: click Allow on the Mac.** Agent calls `retarget(target="ssh://brkrabac@brians-macbook-pro-os")`. The macOS announce-and-acknowledge dialog is step 4 of §6.2, raised on the *new* target. If nobody answers and the Mac is idle → proceed; if nobody answers and someone is using it → **not allowed** (`coexistence.md` §7.3). If it is declined, the session stays on Linux and says so.
+**6. → HUMAN: click Allow on the Mac.** Agent calls `retarget(target="ssh://a-user@example-macbook")`. The macOS announce-and-acknowledge dialog is step 4 of §6.2, raised on the *new* target. If nobody answers and the Mac is idle → proceed; if nobody answers and someone is using it → **not allowed** (`coexistence.md` §7.3). If it is declined, the session stays on Linux and says so.
 
 **7. Agent verifies — `doctor` again.** Now bound to `remote-ssh:macos`. Suppose it reports `screen_recording: denied`, `accessibility: unknown`, `read_only: true (remote default)`, `session: unlocked`.
 

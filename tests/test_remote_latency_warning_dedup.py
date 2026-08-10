@@ -63,8 +63,8 @@ def test_remote_latency_warning_fires_once_across_two_mounts_of_the_same_channel
     Must warn once between them, not once each."""
     caplog.set_level(logging.WARNING, logger="amplifier_module_tool_computer_use")
 
-    root_backend = _FakeRemoteBackend("macos", "brkrabac@brians-macbook-pro-os")
-    child_backend = _FakeRemoteBackend("macos", "brkrabac@brians-macbook-pro-os")
+    root_backend = _FakeRemoteBackend("macos", "a-user@example-macbook")
+    child_backend = _FakeRemoteBackend("macos", "a-user@example-macbook")
 
     guard1 = _build_coexistence_guard(root_backend, {})
     guard2 = _build_coexistence_guard(child_backend, {})
@@ -84,7 +84,7 @@ def test_remote_latency_warning_still_fires_at_all_for_a_fresh_channel(caplog):
     proves the fix dedups per-channel, not process-wide-forever."""
     caplog.set_level(logging.WARNING, logger="amplifier_module_tool_computer_use")
 
-    backend = _FakeRemoteBackend("macos", "brkrabac@some-other-mac")
+    backend = _FakeRemoteBackend("macos", "a-user@some-other-mac")
     guard = _build_coexistence_guard(backend, {})
 
     assert guard is not None
@@ -98,15 +98,13 @@ def test_remote_latency_warning_dedups_independently_per_channel(caplog):
     once-ever flag."""
     caplog.set_level(logging.WARNING, logger="amplifier_module_tool_computer_use")
 
-    mac = _FakeRemoteBackend("macos", "brkrabac@brians-macbook-pro-os")
-    windows = _FakeRemoteBackend("windows-wsl2", "brkrabac@alienware-r13")
+    mac = _FakeRemoteBackend("macos", "a-user@example-macbook")
+    windows = _FakeRemoteBackend("windows-wsl2", "a-user@example-desktop")
 
     _build_coexistence_guard(mac, {})
     _build_coexistence_guard(windows, {})
     # A second mount against the FIRST channel again - still must not re-warn.
-    _build_coexistence_guard(
-        _FakeRemoteBackend("macos", "brkrabac@brians-macbook-pro-os"), {}
-    )
+    _build_coexistence_guard(_FakeRemoteBackend("macos", "a-user@example-macbook"), {})
 
     hits = _remote_latency_records(caplog.records)
     assert len(hits) == 2, (

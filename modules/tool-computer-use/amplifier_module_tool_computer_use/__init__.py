@@ -4571,8 +4571,8 @@ async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any
 # never a guess papered over a gap. In particular: a Tailscale peer's
 # reported "owner" is the Tailscale ACCOUNT the node is registered to, NOT
 # necessarily a Unix login name on that machine - real-world example that
-# motivated this: a tailnet reporting owner "bkrabach@github" for a machine
-# whose actual working ssh user is "brkrabac". Treating that owner string as
+# motivated this: a tailnet reporting owner "alice@github" for a machine
+# whose actual working ssh user is "a-user". Treating that owner string as
 # an ssh user would silently produce a wrong, confidently-stated target.
 # Only `~/.ssh/config`'s explicit `User` directive for a Host is trusted as
 # an asserted ssh login user; everything else comes back with `user: null,

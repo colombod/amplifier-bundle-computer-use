@@ -110,7 +110,7 @@ pre-launch values). All three were measured directly - see the top-level
 task report for the raw before/after numbers.
 
 Previously left unresolved, now root-caused on real hardware
-(`alienware-r13`, a physical 3840x2160 panel at 150% scaling) and fixed:
+(`example-desktop`, a physical 3840x2160 panel at 150% scaling) and fixed:
 the Pause/Cancel button sub-rectangles painted with the *band's* color
 rather than their own distinct gray/red, even though a paint-time
 diagnostic confirmed `OverlayBand.PauseRect`/`CancelRect` held the exact

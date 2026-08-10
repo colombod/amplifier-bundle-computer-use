@@ -99,7 +99,7 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 # coordinates are PHYSICAL screen pixels of the virtual desktop"), but an unaware
 # process's window bounds and painted content both get scaled by the target
 # monitor's DPI factor before reaching the screen. Measured directly on real
-# hardware (`alienware-r13`, a physical 3840x2160 panel at 150% scaling): a band
+# hardware (`example-desktop`, a physical 3840x2160 panel at 150% scaling): a band
 # requested at physical X=3840 rendered with its visible left edge at physical
 # X=5760 - exactly 3840 * 1.5 - and the Pause/Cancel button rects, computed from
 # the same physical coordinates as the band, ended up outside where a human (or
