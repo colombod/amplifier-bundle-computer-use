@@ -62,6 +62,7 @@ xevent: Any = _xevent
 
 from .backend import (
     BackendError,
+    MonitorEnumerationUnavailable,
     MonitorInfo,
     ProbeResult,
     ScreenGeometry,
@@ -466,9 +467,32 @@ class LinuxX11Backend:
         except Exception as exc:  # any protocol failure -> unavailable
             raise BackendError(f"RandR monitor enumeration failed: {exc}") from exc
         if not reply.monitors:
-            raise BackendError(
-                "RandR reported zero active monitors; cannot select a "
-                "per-monitor target on this X11 session"
+            connected = self._connected_output_count()
+            if connected == 0:
+                raise MonitorEnumerationUnavailable(
+                    "RandR reported zero active monitors; cannot select a "
+                    "per-monitor target on this X11 session (RandR also "
+                    "reports zero CONNECTED outputs on this server - no "
+                    "monitor is physically attached, so this is the "
+                    "expected headless/virtual-display state, not a "
+                    "failure)",
+                    expected=True,
+                )
+            if connected is None:
+                raise MonitorEnumerationUnavailable(
+                    "RandR reported zero active monitors; cannot select a "
+                    "per-monitor target on this X11 session (could not "
+                    "determine this server's connected-output count, so "
+                    "this is treated conservatively as NOT the expected "
+                    "headless case)"
+                )
+            raise MonitorEnumerationUnavailable(
+                f"RandR reported zero active monitors despite {connected} "
+                "CONNECTED output(s) on this server - a monitor appears to "
+                "be physically attached yet RandR's monitor-object "
+                "enumeration is not reporting it; this is a genuine "
+                "anomaly, not the expected headless case, and the "
+                "whole-desktop fallback may not be trustworthy here"
             )
         monitors: list[MonitorInfo] = []
         for i, m in enumerate(reply.monitors):
@@ -491,6 +515,48 @@ class LinuxX11Backend:
                 )
             )
         return monitors
+
+    def _connected_output_count(self) -> int | None:
+        """How many RandR outputs this X server reports as `Connected` -
+        NOT the same as `len(GetScreenResources().outputs)` (every output the
+        driver knows about, connected or not: a real GPU commonly reports an
+        output - e.g. `HDMI-0`/`USB-C-0`..`USB-C-3` - for every physical
+        connector on the card, whether or not anything is plugged into it).
+
+        This is the discriminator `list_monitors()` uses, on the "RandR
+        reports zero active monitors" branch, to tell "genuinely no monitor
+        attached" apart from "a monitor IS attached and RandR's monitor-
+        object enumeration is simply broken". Verified live on the machine
+        that motivated this: a real GDM session reported 5 RandR outputs -
+        ALL `Disconnected` - alongside `GetMonitors` returning zero. That
+        is genuinely the headless case (the GPU has physical connectors;
+        nothing is plugged into any of them), not an anomaly, even though
+        raw output count is nonzero.
+
+        Returns `None` (never raises) if this probe itself cannot complete
+        - e.g. `GetScreenResources`/`GetOutputInfo` fail, or this RandR
+        version predates them. `None` is treated by the caller the same as
+        "a monitor IS connected" (stay loud) - the honest, conservative
+        default for when discrimination itself is unavailable; this probe
+        must never let its OWN failure be silently read as "benign".
+        """
+        try:
+            resources = self._root.xrandr_get_screen_resources()
+            connected = 0
+            for output in resources.outputs:
+                info = self._display.xrandr_get_output_info(
+                    output, resources.config_timestamp
+                )
+                # RandR `Connection` enum: 0=Connected, 1=Disconnected,
+                # 2=UnknownConnection. Only 0 counts - "Unknown" is not a
+                # proof of "no monitor attached".
+                if info.connection == 0:
+                    connected += 1
+            return connected
+        except Exception:  # noqa: BLE001 - a failed probe must never mask
+            # the real "zero active monitors" error, and must never be
+            # misread as proof of the benign case.
+            return None
 
     def capture(self, region: tuple[int, int, int, int] | None = None) -> bytes:
         """In-process `GetImage` - no `import`/ImageMagick subprocess."""

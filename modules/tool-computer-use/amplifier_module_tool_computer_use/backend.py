@@ -39,6 +39,35 @@ class BackendError(RuntimeError):
     """A backend could not complete a requested action, or could not be reached."""
 
 
+class MonitorEnumerationUnavailable(BackendError):
+    """`Backend.list_monitors()` could not enumerate monitors, carrying one
+    extra fact `_resolve_display_for_target` (`__init__.py`) needs to decide
+    how loud the resulting whole-desktop-bounding-box fallback should be:
+    whether the backend could affirmatively PROVE no external monitor is
+    connected.
+
+    `expected=True` means the backend confirmed, via its own honest probe
+    (never a guess), that this is genuinely a headless/no-monitor session -
+    the whole-desktop fallback is not merely "the best we can do", it is
+    provably the correct answer, so no human needs to see it.
+
+    `expected=False` (the default - and what a plain, un-decorated
+    `BackendError` from an older/other `list_monitors()` implicitly means,
+    via `getattr(exc, "expected", False)`) covers two cases the caller
+    cannot otherwise tell apart, and treats both the same, conservatively:
+      - the backend actively detected the OPPOSITE (a real monitor IS
+        connected, yet RandR/equivalent still reports zero monitors) - a
+        genuine anomaly worth a human's attention, or
+      - the backend has no way to make this determination at all.
+    Either way the fallback stays exactly as loud as it always was before
+    this distinction existed - only the PROVEN-benign case gets quieter.
+    """
+
+    def __init__(self, message: str, *, expected: bool = False) -> None:
+        super().__init__(message)
+        self.expected = expected
+
+
 @dataclass(frozen=True)
 class ProbeResult:
     """Outcome of `Backend.probe()`.

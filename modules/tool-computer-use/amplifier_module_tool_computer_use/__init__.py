@@ -769,15 +769,40 @@ class ComputerTool:
         display - reports the SAME rectangle enumeration would have, had it
         worked. That is not "pretending there is one monitor" (no `MonitorInfo`
         is invented); it is correctly falling back to the one mode that was
-        already right for this machine, loudly logged so it stays diagnosable.
+        already right for this machine.
+
+        Third-instance-of-a-defect-class fix: whether that fallback is logged
+        at WARNING or DEBUG now depends on `exc.expected`
+        (`backend.MonitorEnumerationUnavailable` - `getattr(exc, "expected",
+        False)` for a plain, un-decorated `BackendError`, which stays exactly
+        as loud as before this fix). `expected=True` means the backend itself
+        proved no monitor is attached (see `linux_x11.LinuxX11Backend.
+        _connected_output_count`) - a platform STATE, not a defeated ask,
+        the same "no intent was defeated" distinction `_mount_unavailable`'s
+        silent/loud split already draws for a different mount-time condition.
+        `expected=False` (an actively detected anomaly, OR a backend that
+        cannot make the determination at all) stays exactly as loud as this
+        warning has always been - only the PROVEN-benign case moved off the
+        human's console; the fact is never lost, `desktop(action="doctor")`'s
+        `target_mode.monitor_count` still reports it on demand. Also deduped
+        to at most once per physical channel per process, reusing
+        `_channel_registry_lock`/`_channel_identity` - the exact mechanism
+        `_mark_remote_latency_warned` already uses to solve "more than one
+        mount() in this process, one physical channel" for a different fact,
+        applied here rather than inventing a second one (this is also the fix
+        for why the message printed twice: `mount()` runs this path once for
+        `amplifier_core`'s protocol-compliance probe and once for the real
+        mount - see `test_double_mount_defect.py`).
+
         This is why `allow_fallback` is only ever `True` when `target` is the
         unconfigured default (`resolve_display()` with no explicit
         `target_monitor` config) - an explicit ask (`target_monitor` config, or
-        a runtime `select_monitor()` call) always fails loud instead, and a
-        target id that IS enumerated but does not match a request always fails
-        loud regardless of `allow_fallback` (see `select_monitor()` call below):
-        a config typo must never silently degrade to a different region of the
-        real, multi-monitor desktop it was supposed to protect against.
+        a runtime `select_monitor()` call) always fails loud instead (raises,
+        below - never reaches this logging at all), and a target id that IS
+        enumerated but does not match a request always fails loud regardless
+        of `allow_fallback` (see `select_monitor()` call below): a config typo
+        must never silently degrade to a different region of the real,
+        multi-monitor desktop it was supposed to protect against.
         """
         target_backend = self._backend if backend is None else backend
         if target == VIRTUAL_DESKTOP:
@@ -791,16 +816,30 @@ class ComputerTool:
             except BackendError as exc:
                 if not allow_fallback:
                     raise
-                logger.warning(
-                    "computer-use: monitor enumeration unavailable for target "
-                    "%r (%s); falling back to whole-desktop bounding-box mode "
-                    "for this session. Expected on a headless/virtual "
-                    "single-display X11 session with no RandR monitor objects "
-                    "- on a REAL multi-monitor desktop this is worth "
-                    "investigating rather than trusting the fallback.",
-                    target,
-                    exc,
-                )
+                if _mark_monitor_enum_warned(_channel_identity(target_backend)):
+                    if bool(getattr(exc, "expected", False)):
+                        logger.debug(
+                            "computer-use: monitor enumeration unavailable "
+                            "for target %r (%s); falling back to "
+                            "whole-desktop bounding-box mode for this "
+                            "session - the backend confirmed no monitor is "
+                            "physically attached, so this is expected "
+                            "platform state, not a failure.",
+                            target,
+                            exc,
+                        )
+                    else:
+                        logger.warning(
+                            "computer-use: monitor enumeration unavailable "
+                            "for target %r (%s); falling back to "
+                            "whole-desktop bounding-box mode for this "
+                            "session. This was NOT confirmed as the "
+                            "expected headless case - on a real desktop "
+                            "this is worth investigating rather than "
+                            "trusting the fallback.",
+                            target,
+                            exc,
+                        )
                 return self._resolve_display_for_target(
                     VIRTUAL_DESKTOP, backend=backend
                 )
@@ -3972,6 +4011,32 @@ def _mark_remote_latency_warned(channel_key: str) -> bool:
         if channel_key in _remote_latency_warned:
             return False
         _remote_latency_warned.add(channel_key)
+        return True
+
+
+#: Third-instance-of-a-defect-class fix (`_resolve_display_for_target`'s
+#: monitor-enumeration fallback, `__init__.py`): which PHYSICAL channels have
+#: already had that fallback's log line (WARNING or DEBUG, depending on
+#: `exc.expected`) printed once in this process. The SAME pattern as
+#: `_remote_latency_warned` immediately above (reusing `_channel_registry_lock`,
+#: not a new lock) applied to a different fact, for the same reason: `mount()`
+#: runs this path once for `amplifier_core`'s protocol-compliance probe and
+#: once for the real mount (see `test_double_mount_defect.py`) - both against
+#: the SAME physical channel - so without this, one real condition printed
+#: twice.
+_monitor_enum_warned: set[str] = set()
+
+
+def _mark_monitor_enum_warned(channel_key: str) -> bool:
+    """Return True the FIRST time `channel_key` is seen in this process for
+    the monitor-enumeration-unavailable fallback (caller should log); False
+    every later call for the same channel (already logged - caller must not
+    log again), regardless of whether that later call's `expected`
+    classification differs from the first."""
+    with _channel_registry_lock:
+        if channel_key in _monitor_enum_warned:
+            return False
+        _monitor_enum_warned.add(channel_key)
         return True
 
 

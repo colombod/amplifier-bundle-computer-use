@@ -18,7 +18,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
 import pytest
-from amplifier_module_tool_computer_use.backend import BackendError
+from amplifier_module_tool_computer_use.backend import (
+    BackendError,
+    MonitorEnumerationUnavailable,
+)
 from amplifier_module_tool_computer_use.linux_x11 import LinuxX11Backend
 from amplifier_module_tool_computer_use.windows import WindowsBackend
 
@@ -121,18 +124,47 @@ class _FakeMonitorsReply:
 
 
 class _FakeDisplay:
-    def __init__(self, atom_names: dict[int, str]) -> None:
+    def __init__(
+        self,
+        atom_names: dict[int, str],
+        output_connections: dict[int, int] | None = None,
+    ) -> None:
         self._atom_names = atom_names
+        # output id -> RandR `Connection` enum (0=Connected, 1=Disconnected,
+        # 2=UnknownConnection) - only consulted by
+        # `_connected_output_count()` via `xrandr_get_output_info`.
+        self._output_connections = output_connections or {}
 
     def get_atom_name(self, atom: int) -> str:
         return self._atom_names[atom]
 
+    def xrandr_get_output_info(self, output: int, _config_timestamp: int):
+        return _FakeOutputInfo(self._output_connections[output])
+
+
+class _FakeOutputInfo:
+    def __init__(self, connection: int) -> None:
+        self.connection = connection
+
+
+class _FakeScreenResources:
+    def __init__(self, outputs: list[int], config_timestamp: int = 1) -> None:
+        self.outputs = outputs
+        self.config_timestamp = config_timestamp
+
 
 class _FakeRoot:
-    def __init__(self, reply: _FakeMonitorsReply | None, has_method: bool = True):
+    def __init__(
+        self,
+        reply: _FakeMonitorsReply | None,
+        has_method: bool = True,
+        screen_resources: _FakeScreenResources | None = None,
+    ):
         self._reply = reply
         if has_method:
             self.xrandr_get_monitors = lambda is_active=True: self._reply
+        if screen_resources is not None:
+            self.xrandr_get_screen_resources = lambda: screen_resources
 
 
 def _connected_backend(root: _FakeRoot, display: _FakeDisplay) -> LinuxX11Backend:
@@ -191,6 +223,60 @@ def test_linux_x11_list_monitors_fails_loud_on_zero_monitors():
 
     with pytest.raises(BackendError, match="zero active monitors"):
         backend.list_monitors()
+
+
+# -- Third-instance-of-a-defect-class fix: the headless-vs-anomaly discriminator --
+
+
+def test_linux_x11_zero_monitors_all_outputs_disconnected_is_expected():
+    """The exact condition verified live on the box that motivated this fix:
+    RandR reports zero active monitors AND zero CONNECTED outputs (every
+    output present but disconnected) - genuinely headless, `expected=True`."""
+    root = _FakeRoot(
+        _FakeMonitorsReply([]),
+        screen_resources=_FakeScreenResources(outputs=[396, 412, 413, 414, 415]),
+    )
+    display = _FakeDisplay(
+        {},
+        output_connections={396: 1, 412: 1, 413: 1, 414: 1, 415: 1},  # all Disconnected
+    )
+    backend = _connected_backend(root, display)
+
+    with pytest.raises(MonitorEnumerationUnavailable) as excinfo:
+        backend.list_monitors()
+    assert excinfo.value.expected is True
+    assert "zero CONNECTED outputs" in str(excinfo.value)
+
+
+def test_linux_x11_zero_monitors_with_a_connected_output_is_anomaly():
+    """A real monitor IS attached (at least one Connected output) yet RandR's
+    monitor-object enumeration still reports zero - a genuine anomaly, not
+    the expected headless case. Must NOT be marked `expected`."""
+    root = _FakeRoot(
+        _FakeMonitorsReply([]),
+        screen_resources=_FakeScreenResources(outputs=[1, 2]),
+    )
+    display = _FakeDisplay({}, output_connections={1: 0, 2: 1})  # one Connected
+    backend = _connected_backend(root, display)
+
+    with pytest.raises(MonitorEnumerationUnavailable) as excinfo:
+        backend.list_monitors()
+    assert excinfo.value.expected is False
+    assert "1 CONNECTED output" in str(excinfo.value)
+
+
+def test_linux_x11_zero_monitors_undeterminable_stays_conservative():
+    """When the connected-output probe itself cannot complete (no
+    `xrandr_get_screen_resources` on this fake, mirroring an older RandR/a
+    probe failure), the honest answer is "cannot tell" - treated the SAME as
+    an anomaly (`expected=False`), never silently assumed benign."""
+    root = _FakeRoot(_FakeMonitorsReply([]))  # no screen_resources configured
+    backend = _connected_backend(root, _FakeDisplay({}))
+
+    with pytest.raises(MonitorEnumerationUnavailable) as excinfo:
+        backend.list_monitors()
+    assert excinfo.value.expected is False
+    assert "could not determine" in str(excinfo.value)
 
 
 def test_linux_x11_list_monitors_survives_atom_lookup_failure():
