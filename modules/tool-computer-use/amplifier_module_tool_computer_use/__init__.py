@@ -1185,12 +1185,36 @@ class ComputerTool:
         Never raises: a mid-session exception here would take down the whole
         request, the exact class of bug D3 already fixed once for
         `native_tool_spec` itself.
+
+        Logged at INFO, not WARNING (bug-hunt defect A): this correction is
+        working exactly as designed - a known model always wins per
+        `resolve_tool_version`'s resolution order, so `corrected` fires
+        whenever a NEW `ComputerTool` mount's first-seen model differs from
+        its mount-time default (e.g. a Haiku sub-agent primed from an Opus
+        parent's config - see call site 1's docstring above). It is not one
+        rare event: empirically it fires once per FRESH mount that needs it
+        (three independent `ComputerTool()` instances each logged their own
+        correction in one process), so a session that spawns many
+        short-lived sub-agents (a session-naming hook, for instance) sees it
+        recur, not once. Nothing about it is actionable by a human, and it
+        is not a signal of failure - the same distinction `_wrap_provider`'s
+        own WARNING-vs-INFO choice already draws for a REAL capability gap
+        (`hook-computer-use/__init__.py`, "WARNING, not info" comment):
+        WARNING is this codebase's reserved level for operator-facing,
+        actionable lines under the default logging configuration (no
+        handlers anywhere, root effective level WARNING); INFO already is,
+        and is meant to be, invisible under that default - exactly like the
+        "guard built" line in `_build_coexistence_guard` below. That default
+        invisibility is not a downgrade to "still in a log file somewhere" -
+        there is no `FileHandler` anywhere in this stack - it is the same
+        audience routing every other benign state transition in this module
+        already receives.
         """
         resolved, corrected = resolve_tool_version(
             model, self._configured_tool_version, previous=self._tool_version
         )
         if corrected:
-            logger.warning(
+            logger.info(
                 "computer-use: model %r requires tool_version %r; correcting "
                 "from %r to avoid the API rejecting every request with this "
                 "pairing (see tool_versions.py)",
@@ -3426,7 +3450,8 @@ def _build_coexistence_guard(
     # fresh here on every call, so a parent session's mount() and a
     # delegated child's mount() sharing the same overlay each got their OWN,
     # disconnected ledger.
-    ledger = _get_channel_ledger(_channel_identity(backend))
+    channel_key = _channel_identity(backend)
+    ledger = _get_channel_ledger(channel_key)
     target_source = getattr(backend, "current_target", None)
     guard = CoexistenceGuard(
         presence=presence,
@@ -3466,7 +3491,24 @@ def _build_coexistence_guard(
     # Every live sample ALSO carries its own measured
     # transport_latency_ms/effective_staleness_ms (presence.PresenceSnapshot)
     # so this is a standing notice, not the only place it is visible.
-    if bool(getattr(backend, "is_remote", False)):
+    # Bug-hunt defect B fix: printed at most once per PHYSICAL channel per
+    # process, not once per `_build_coexistence_guard()` call. This describes
+    # a property of the backend/channel (its transport latency), not of any
+    # one session, so a root session's own mount() and a delegated child's
+    # mount() against the SAME remote target (`_channel_identity` - the
+    # normal shape of activate() then delegate to computer-operator) each
+    # independently built a guard and each logged this WARNING - twice for
+    # one fact. Deduped with `_remote_latency_warned`/`_channel_registry_lock`
+    # below, the SAME mechanism (and the same lock, reused rather than
+    # duplicated) `_announcement_decisions` already uses to solve this exact
+    # "more than one mount() in this process, one physical channel" problem
+    # for session-start disclosure - see that dict's own docstring. Stays a
+    # real `logger.warning` (never silenced, never demoted): unlike defect A,
+    # this IS safety-relevant and must remain visible - only the per-mount
+    # duplication is the noise being removed, not the warning itself.
+    if bool(getattr(backend, "is_remote", False)) and _mark_remote_latency_warned(
+        channel_key
+    ):
         logger.warning(
             "coexistence: backend %r is remote - every presence sample "
             "crosses a transport whose measured latency (296-875ms, "
@@ -3907,6 +3949,30 @@ def _get_channel_ledger(channel_key: str) -> HeldInputLedger:
             ledger = HeldInputLedger()
             _channel_ledgers[channel_key] = ledger
         return ledger
+
+
+#: Bug-hunt defect B: which PHYSICAL channels have already had the remote-
+#: latency notice (`_build_coexistence_guard` above) printed once in this
+#: process - reused rather than a new lock, for the same momentary-
+#: contention reason `_channel_registry_lock` already exists (dict
+#: read/write only, never held across the actual `logger.warning` call).
+#: Keyed exactly like `_channel_ledgers`/`_announcement_decisions`
+#: (`_channel_identity`): this is a property of the physical machine, not of
+#: any one mount() - a root session's mount() and a delegated child's
+#: mount() against the SAME remote target must warn once between them, not
+#: once each.
+_remote_latency_warned: set[str] = set()
+
+
+def _mark_remote_latency_warned(channel_key: str) -> bool:
+    """Return True the FIRST time `channel_key` is seen in this process
+    (caller should log the warning); False every later call for the same
+    channel (already warned - caller must not log again)."""
+    with _channel_registry_lock:
+        if channel_key in _remote_latency_warned:
+            return False
+        _remote_latency_warned.add(channel_key)
+        return True
 
 
 @dataclass

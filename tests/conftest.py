@@ -11,6 +11,14 @@ most of the existing announcement tests use `_FakeRemoteBackend("macos")`,
 which all hash to the same channel key by design (that IS the behavior
 under test), so isolation between test functions has to be enforced here,
 not left to chance.
+
+`_remote_latency_warned` (bug-hunt defect B: the remote-latency safety
+notice deduped once-per-physical-channel, mirroring `_announcement_decisions`
+above) has the exact same shape and the exact same leak risk - cleared here
+for the same reason, not left to unique-per-test host names like
+`_channel_ledgers`/`_channel_band_state` (see `test_retarget.py`), because
+several of its own tests deliberately reuse the same host across test
+functions to prove the "still warns once for a fresh channel" case.
 """
 
 from __future__ import annotations
@@ -29,5 +37,7 @@ def _clear_announcement_decisions():
     import amplifier_module_tool_computer_use as cu
 
     cu._announcement_decisions.clear()
+    cu._remote_latency_warned.clear()
     yield
     cu._announcement_decisions.clear()
+    cu._remote_latency_warned.clear()

@@ -19,6 +19,7 @@ one that demonstrates the gap) and PASS once the wrapped `complete()` forwards
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import sys
 from pathlib import Path
@@ -122,6 +123,12 @@ def test_wrapped_complete_forwards_request_model_to_note_model_and_corrects_tool
     the wrapped `provider.complete()` must correct `_tool_version` - this is
     exactly the live-session scenario `note_model`'s own docstring promises,
     and before this fix could never happen because nothing ever called it.
+
+    Bug-hunt defect A: the correction is logged at INFO
+    (`amplifier_module_tool_computer_use`, where `note_model` actually lives),
+    not WARNING - it is expected, working-as-designed behavior, not an
+    operator-facing signal. See `test_tool_version_correction_does_not_reach_console_at_default_level`
+    below for the console-visibility half of this fix.
     """
     computer = ComputerTool(_FakeBackend(), {"model": "claude-opus-5"})
     assert computer._tool_version == "computer_20251124"  # mount-time baseline
@@ -130,15 +137,51 @@ def test_wrapped_complete_forwards_request_model_to_note_model_and_corrects_tool
     provider = _AnthropicProviderNoStream()
     assert hook_mod._wrap_provider(provider, coord, max_inline=3) is True
 
-    caplog.set_level(logging.WARNING, logger="amplifier_module_hook_computer_use")
+    caplog.set_level(logging.INFO, logger="amplifier_module_tool_computer_use")
     request = _FakeRequest(model="claude-sonnet-4-5-20250929")
     result = _run(provider.complete(request))
 
     assert result == "ok"
     assert computer._tool_version == "computer_20250124"
     assert any(
-        "correcting" in rec.message and "computer_20250124" in rec.message
+        "correcting" in rec.message
+        and "computer_20250124" in rec.message
+        and rec.levelno == logging.INFO
         for rec in caplog.records
+    )
+
+
+def test_tool_version_correction_does_not_reach_console_at_default_level():
+    """Bug-hunt defect A: an internal self-correction (right information,
+    wrong audience - same class as the mount-noise fix) must not print to a
+    real user's console. This app's DEFAULT logging configuration has no
+    handlers anywhere and a root effective level of WARNING (measured via
+    plain `logging.getLogger()` with no fixtures involved) - simulate that
+    real console with our own `StreamHandler` rather than trusting `caplog`
+    (which installs its own capture regardless of app config) and prove
+    nothing is written to it when a real correction fires.
+    """
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    root.handlers = [handler]
+    root.setLevel(logging.WARNING)  # this app's measured default
+    try:
+        computer = ComputerTool(_FakeBackend(), {"model": "claude-opus-5"})
+        coord = _FakeCoordinator({"computer": computer})
+        provider = _AnthropicProviderNoStream(default_model="claude-haiku-4-5-20251001")
+        # Wrap-time priming alone triggers a real correction (mount-time
+        # config says claude-opus-5, this provider's default is Haiku) -
+        # exactly the Haiku sub-agent scenario reported in the defect.
+        hook_mod._wrap_provider(provider, coord, max_inline=3)
+    finally:
+        root.handlers, root.level = saved_handlers, saved_level
+
+    assert computer._tool_version == "computer_20250124"  # correction still happened
+    assert stream.getvalue() == "", (
+        f"expected nothing on the console at the default level, got: "
+        f"{stream.getvalue()!r}"
     )
 
 
