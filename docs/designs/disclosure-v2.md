@@ -118,7 +118,7 @@ Ranked by how badly each fails §7.1: config-removed > failed-to-render > ignore
 
 ### 2.3 Probed on live hardware — Linux X11
 
-Host `spark-1`, `DISPLAY=:1`, X.Org with GNOME/mutter compositing, 1024×768, python-xlib 0.33. Nothing in the repository was modified.
+Host `example-linux-host`, `DISPLAY=:1`, X.Org with GNOME/mutter compositing, 1024×768, python-xlib 0.33. Nothing in the repository was modified.
 
 | # | Probe | Result |
 |---|---|---|
@@ -131,7 +131,7 @@ P1–P3 remain valid and are what would make the ring buildable *if* Q1 ever jus
 
 ### 2.4 Probed on live hardware today — macOS
 
-Host `brians-macbook-pro-os`, macOS 26.6 arm64, single 1728×1117 display at backing scale 2.0, console user `brkrabac` == the SSH user. Full transcript and interpretation in §5.1. No repository file was modified; every probe binary and capture was deleted from the target afterwards.
+Host `example-macbook`, macOS 26.6 arm64, single 1728×1117 display at backing scale 2.0, console user `a-user` == the SSH user. Full transcript and interpretation in §5.1. No repository file was modified; every probe binary and capture was deleted from the target afterwards.
 
 **What I could not verify, and will not pretend to:** whether *any* of these indicators is **noticeable to a distracted human**. That is Q1, it has never been run on any platform, and this revision makes it a **gate** rather than an epilogue (§4.4, §8).
 
@@ -343,7 +343,7 @@ The review's fifth finding was that the "impossible" verdict was SSH-only and ge
 
 ### 5.1 What I ran today, and what came back
 
-Six probes on `brians-macbook-pro-os` (macOS 26.6, arm64, 1728×1117 @ 2.0, console user == SSH user `brkrabac`). Probes M1–M2 create nothing visible. M3–M6 put a small window on the display for under two seconds each, `.accessory` activation policy, `orderFront` (never `makeKeyAndOrderFront`), `ignoresMouseEvents = true` — **no focus steal, no input injected**. All binaries and captures deleted from the target afterwards.
+Six probes on `example-macbook` (macOS 26.6, arm64, 1728×1117 @ 2.0, console user == SSH user `a-user`). Probes M1–M2 create nothing visible. M3–M6 put a small window on the display for under two seconds each, `.accessory` activation policy, `orderFront` (never `makeKeyAndOrderFront`), `ignoresMouseEvents = true` — **no focus steal, no input injected**. All binaries and captures deleted from the target afterwards.
 
 **M1 — the SSH process's security session (read-only, no window).**
 ```
@@ -358,7 +358,7 @@ CGMainDisplayID = 1
 SessionGetInfo status=0 sid=0x186b9 bits=0x2030
   sessionIsRoot=0  sessionHasGraphicAccess=1  sessionHasTTY=1
 CGSessionCopyCurrentDictionary = non-NULL
-    kCGSSessionOnConsoleKey = 1;  kCGSSessionUserIDKey = 501;  kCGSSessionUserNameKey = brkrabac;
+    kCGSSessionOnConsoleKey = 1;  kCGSSessionUserIDKey = 501;  kCGSSessionUserNameKey = a-user;
 CGMainDisplayID = 1
 ```
 
