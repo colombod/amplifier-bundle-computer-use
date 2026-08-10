@@ -38,7 +38,7 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -198,13 +198,98 @@ def _prune_shots() -> None:
         pass
 
 
+class _RetargetRefused(RuntimeError):
+    """`desktop(action="retarget")` refused before touching anything -
+    busy, or the new target fails one of §6.5's fail-loud checks. Distinct
+    from `AnnouncementRefused` (a human declined disclosure) so a caller
+    can tell "nobody answered" from "this retarget cannot even be
+    attempted right now" apart."""
+
+
+@dataclass(frozen=True)
+class _Binding:
+    """Everything about the machine a `ComputerTool` instance drives that
+    must change together, atomically, when the session re-targets (M4,
+    docs/designs/capability-awareness.md \\u00a76). This is the fix a six-lens
+    council named for a verified race: `retarget()` used to be described as
+    seven sequential field writes on `self` ("`self._backend = new`;
+    `self._announced = False`; ..."), asserted to be atomic because they
+    happen one after another in the same function. They are not - CPython's
+    GIL preempts between individual bytecode instructions (not just at I/O),
+    so a concurrent, UNLOCKED reader (`_ensure_announced`'s own fast path -
+    see that method's docstring for why it is deliberately unlocked) could
+    observe a MIX: the NEW backend already swapped in, paired with the OLD
+    `_announced=True` not yet reset. That mix is exactly the bug: a model
+    issuing `retarget(mac-B)` and `screenshot()` in the same turn could read
+    "already announced" (true of mac-A) and capture mac-B's screen with no
+    disclosure ever shown for it - a direct \\u00a77.1 violation.
+
+    The fix: collapse every field that must change together into ONE
+    object, and make retarget replace the WHOLE object with a single
+    reference assignment (`ComputerTool._binding = new`), never a field at
+    a time. `self._binding` is a single attribute; a `LOAD_ATTR`/`STORE_ATTR`
+    on it is one bytecode op the GIL cannot preempt mid-instruction. Every
+    reader - however many times, from however many threads, at whatever
+    granularity it reads `self._binding` - therefore only ever sees the OLD
+    binding whole or the NEW binding whole, never a mix of the two. That
+    guarantee only holds because `retarget()` (see that method) builds the
+    ENTIRE new binding - connect, guard, disclosure, policy, display - off
+    to the side, fully formed and ALREADY DISCLOSED, before this object is
+    ever installed. There is no "swapped but not yet disclosed" state a
+    reader could ever observe through `self._binding`, because disclosure
+    happens during construction, not after installation.
+
+    Deliberately excludes `ComputerTool._mouse_pending`: \\u00a76.3 requires it
+    to already be empty before a retarget is attempted (refused otherwise,
+    see `retarget()` step 0), so it needs no atomic handling of its own -
+    there is nothing in it to tear.
+
+    Never mutated in place after construction - every field change, even a
+    single-field one (e.g. `mount()` installing the coexistence guard right
+    after construction, or `resolve_display()` updating `display`), goes
+    through `dataclasses.replace()` and a fresh `self._binding = ...`
+    assignment. `ComputerTool`'s `_backend`/`_is_remote`/... properties are
+    sugar over exactly that pattern, kept so every existing reader
+    (`self._backend`) and every existing single-field test/mount() writer
+    (`tool._coexistence_guard = ...`) keeps working unchanged.
+    """
+
+    backend: Backend
+    is_remote: bool
+    read_only: bool
+    gate_writes: bool
+    clipboard_read_policy: str
+    coexistence_guard: CoexistenceGuard | None
+    channel_key: str | None
+    ledger: HeldInputLedger | None
+    band_state: _ChannelBandState | None
+    display: Display | None
+    current_monitor: MonitorInfo | None
+    announced: bool
+    announcement: Any | None
+    announce_refused: AnnouncementRefused | None
+    # Remote-only (\u00a78.1/\u00a79.1) - see `ComputerTool._sync_remote_announcement_state`.
+    # Reset to `False` on every retarget: a stale `True` carried over from the
+    # OLD target would mask a real Pause/Cancel click on the NEW target's own
+    # overlay (each flag is edge-triggered, "at most once per session" - a
+    # retarget starts a new physical channel, so it starts a new edge).
+    remote_pause_seen: bool
+    remote_cancel_seen: bool
+
+
 class ComputerTool:
     """Executes Anthropic computer-tool actions against whatever desktop the
     selected `Backend` can reach."""
 
     def __init__(self, backend: Backend, config: dict[str, Any] | None = None) -> None:
         cfg = config or {}
-        self._backend = backend
+        # `backend` itself is folded into `self._binding` at the end of this
+        # constructor (M4, docs/designs/capability-awareness.md \u00a76) - see
+        # `_Binding`'s own docstring for why the backend and every field
+        # below that is scoped to IT (not held in separate `self._X`
+        # attributes here). Local variables (`is_remote`, `read_only`, ...)
+        # carry these values through the rest of `__init__` unchanged from
+        # before this fix; only the FINAL storage is different.
         # Kept for `_ensure_announced` (see that method): the announcement is
         # no longer built at mount() time, so the config it needs must be
         # available later, at first real use.
@@ -231,16 +316,13 @@ class ComputerTool:
         # any Backend can opt in without this module depending on
         # RemoteBackend's concrete type - only RemoteBackend sets it True
         # today (see remote_backend.py).
-        self._is_remote = bool(getattr(backend, "is_remote", False))
+        is_remote = bool(getattr(backend, "is_remote", False))
         read_only_cfg = cfg.get("read_only")
-        if read_only_cfg is None:
-            # Unconfigured default: ON for remote (a machine you are, by
-            # definition, not looking at - see docs/designs/remote-transport.md
-            # \u00a714), unchanged (OFF) for local - preserves every existing
-            # local-mode caller's behavior exactly.
-            self._read_only = self._is_remote
-        else:
-            self._read_only = bool(read_only_cfg)
+        # Unconfigured default: ON for remote (a machine you are, by
+        # definition, not looking at - see docs/designs/remote-transport.md
+        # \u00a714), unchanged (OFF) for local - preserves every existing
+        # local-mode caller's behavior exactly.
+        read_only = is_remote if read_only_cfg is None else bool(read_only_cfg)
         gate_cfg = cfg.get("gate_writes")
         if gate_cfg is None:
             # "Destructive" is undecidable from a click (Delete looks like any
@@ -251,10 +333,10 @@ class ComputerTool:
             # unaffected. Flipping read_only off on a remote target therefore
             # can never silently produce "full write access + no gate": the
             # gate turns on in the same step, unless explicitly disabled below.
-            self._gate_writes = self._is_remote and not self._read_only
+            gate_writes = is_remote and not read_only
         else:
-            self._gate_writes = bool(gate_cfg)
-            if self._is_remote and not self._gate_writes and not self._read_only:
+            gate_writes = bool(gate_cfg)
+            if is_remote and not gate_writes and not read_only:
                 logger.warning(
                     "computer-use: gate_writes explicitly disabled for a remote, "
                     "non-read_only target - every write action will execute with "
@@ -313,12 +395,13 @@ class ComputerTool:
         # request the caller is entitled to know failed).
         self._target_monitor_explicit: bool = bool(cfg.get("target_monitor"))
         self._monitors: list[MonitorInfo] = []
-        # None in virtual-desktop mode; otherwise the MonitorInfo `display` is
-        # currently scoped to. See `_resolve_display_for_target`.
-        self._current_monitor: MonitorInfo | None = None
-        # D2: resolved once (by mount(), right after backend selection) and cached -
-        # never touched on the request hot path. See `resolve_display`.
-        self._display: Display | None = None
+        # `current_monitor`/`display` (below, on `_Binding`): `current_monitor`
+        # is `None` in virtual-desktop mode, otherwise the MonitorInfo
+        # `display` is currently scoped to (see `_resolve_display_for_target`).
+        # `display` is resolved once (by mount(), right after backend
+        # selection) and cached - never touched on the request hot path (see
+        # `resolve_display`). Both start `None` in the `_Binding` constructed
+        # at the end of this method.
 
         # -- security hardening: per-session screenshot scoping ---------------
         # A fresh id per `ComputerTool` instance (i.e. per mount, in practice
@@ -353,53 +436,40 @@ class ComputerTool:
         # `DesktopTool`), in which case this policy is moot.
         clipboard_policy_cfg = cfg.get("clipboard_read_policy")
         if clipboard_policy_cfg is None:
-            self._clipboard_read_policy = "redact" if self._is_remote else "allow"
+            clipboard_read_policy = "redact" if is_remote else "allow"
         else:
-            self._clipboard_read_policy = str(clipboard_policy_cfg)
-            if self._clipboard_read_policy not in {"allow", "redact", "block"}:
+            clipboard_read_policy = str(clipboard_policy_cfg)
+            if clipboard_read_policy not in {"allow", "redact", "block"}:
                 raise ValueError(
                     "config 'clipboard_read_policy' must be one of "
                     f"'allow'/'redact'/'block', got {clipboard_policy_cfg!r}"
                 )
 
         # -- human/agent coexistence (docs/designs/coexistence.md) -----------
-        # Built by `mount()` (`_build_coexistence_guard`), never constructed
-        # here directly - it needs the concrete backend instance, which does
-        # not exist yet at `__init__` time (`ComputerTool.__init__` receives
-        # an already-constructed `backend`, so in practice this only matters
-        # for readability: the guard is assigned right after construction).
-        # `None` on any platform where a proven per-platform GUARD band does
-        # not (yet) exist - see `presence.GUARD_MEASURED` - so this feature
-        # never claims detection it cannot back with evidence.
-        self._coexistence_guard: CoexistenceGuard | None = None
-        # -- band lifetime (docs/designs/band-lifetime.md, Alt A) -------------
-        # All three set together by `mount()`, right after
-        # `_coexistence_guard` - `None`/`None`/`None` whenever no guard was
-        # built for this backend (same population as before this fix: no
-        # coexistence layer at all means no held-input tracking and no
-        # band-lifetime tracking either). `_channel_key` identifies the
-        # PHYSICAL channel (`_channel_identity`); `_ledger` and `_band_state`
-        # are the shared, channel-scoped objects `_get_channel_ledger`/
+        # `coexistence_guard`/`channel_key`/`ledger`/`band_state` below are
+        # ALL `None` here and set together by `mount()` right after
+        # construction (`_build_coexistence_guard` needs the concrete
+        # backend instance's identity, which is settled but not yet worth
+        # duplicating logic for here) - `None`/`None`/`None`/`None` whenever
+        # no guard was built for this backend (no coexistence layer at all:
+        # no held-input tracking, no band-lifetime tracking, no disclosure
+        # channel - see `presence.GUARD_MEASURED`, \u00a75.5's "never claim a
+        # guarantee you don't have"). `channel_key` identifies the PHYSICAL
+        # channel (`_channel_identity`); `ledger`/`band_state` are the
+        # shared, channel-scoped objects `_get_channel_ledger`/
         # `_get_channel_band_state` hand out - the same objects every other
         # `ComputerTool` mount() driving this same channel also holds, which
         # is what closes F8 (band-lifetime.md \\u00a710).
-        self._ledger: HeldInputLedger | None = None
-        self._channel_key: str | None = None
-        self._band_state: _ChannelBandState | None = None
+        #
         # Per-instance pending-coordinate box for a held mouse button,
         # mirroring `RemoteAgent._mouse_pending` exactly (`remote_agent.py`) -
         # `left_mouse_up` updates the box with its real coordinates and
         # releases THROUGH the ledger so `backend.mouse_up` fires exactly
         # once, whether triggered by the explicit up or by the ledger's own
-        # deadman/release_all.
+        # deadman/release_all. NOT part of `_Binding` (see that class's
+        # docstring): \u00a76.3 requires it to already be empty before a
+        # retarget is attempted.
         self._mouse_pending: dict[str, dict[str, int | None]] = {}
-        # The session-start disclosure channel `_ensure_announced` builds for
-        # this backend (`_build_announcement`) on this session's FIRST real
-        # action - an overlay object to keep alive for the tool's lifetime,
-        # or `None` for a one-shot channel (macOS's dialog) or a backend with
-        # no channel at all. Held here (not just a local) so it is not
-        # garbage-collected out from under its own background poll thread.
-        self._announcement: Any | None = None
         # -- session-start disclosure: gated at FIRST REAL USE, not mount() --
         # See `_ensure_announced` for the full rationale (docs/designs/
         # coexistence.md \u00a77, and the double-mount defect this closes: a
@@ -409,26 +479,63 @@ class ComputerTool:
         # lock is per-INSTANCE (not the module-level `_announcement_lock`,
         # which guards the cross-instance/cross-process channel cache) - it
         # serializes this instance's own check-then-act sequence against two
-        # actions racing to be "first".
+        # actions racing to be "first", AND (M4) against a concurrent
+        # `retarget()` - see that method's docstring for why sharing this
+        # one lock with `_ensure_announced` is what makes the verified race
+        # structurally impossible rather than merely unlikely.
         self._announce_lock: threading.Lock = threading.Lock()
-        self._announced: bool = False
-        # Sticky for the life of this instance (this mount, this session):
-        # once set, every later call to `_ensure_announced` - from any
-        # thread, for `computer` OR `desktop` - re-raises this SAME error
-        # immediately, without touching the backend again. This is what
-        # makes a refusal mean "stop driving" structurally: `_ensure_announced`
-        # is the one gate both tools' `execute()` call before doing anything
-        # else, so there is no second door a refused session can get through.
-        self._announce_refused: AnnouncementRefused | None = None
-        # Remote-only (docs/designs/coexistence.md \u00a78.1/\u00a79.1): the target's
-        # own persistent overlay is invisible to this controller until asked
+        # `announced`/`announcement`/`announce_refused` below: `announced`
+        # sticky-False until this session's first real action successfully
+        # builds (or is refused) a disclosure; `announce_refused` sticky for
+        # the life of a BINDING once set (see `_ensure_announced`) - once
+        # set, every later call re-raises this SAME error immediately,
+        # without touching the backend again, which is what makes a
+        # refusal mean "stop driving" structurally: `_ensure_announced` is
+        # the one gate both tools' `execute()` call before doing anything
+        # else, so there is no second door a refused session can get
+        # through. `announcement` is the disclosure channel's own handle -
+        # an overlay object to keep alive for the tool's lifetime, or
+        # `None` for a one-shot channel (macOS's dialog) or a backend with
+        # no channel at all.
+        #
+        # `remote_pause_seen`/`remote_cancel_seen`: remote-only
+        # (docs/designs/coexistence.md \u00a78.1/\u00a79.1) - the target's own
+        # persistent overlay is invisible to this controller until asked
         # (see `_sync_remote_announcement_state`) - nothing observes the
         # target's real input events directly. Edge-triggered, not level:
         # each flips true at most once per session, so a human clicking
         # Pause/Cancel is applied to this session's guard exactly once, not
         # once per guarded write for the remainder of the session.
-        self._remote_pause_seen: bool = False
-        self._remote_cancel_seen: bool = False
+        #
+        # All of the above (backend, is_remote/read_only/gate_writes/
+        # clipboard_read_policy, coexistence_guard/channel_key/ledger/
+        # band_state, display/current_monitor, announced/announcement/
+        # announce_refused, remote_pause_seen/remote_cancel_seen) live
+        # together on ONE `_Binding` - see that class's docstring for why:
+        # this is the fix for the verified re-target race (M4,
+        # docs/designs/capability-awareness.md \u00a76). `mount()`/
+        # `resolve_display()`/`select_monitor()`/`_ensure_announced()`
+        # update individual fields via the properties below (sugar over
+        # `dataclasses.replace`); `retarget()` replaces the WHOLE object in
+        # one assignment.
+        self._binding = _Binding(
+            backend=backend,
+            is_remote=is_remote,
+            read_only=read_only,
+            gate_writes=gate_writes,
+            clipboard_read_policy=clipboard_read_policy,
+            coexistence_guard=None,
+            channel_key=None,
+            ledger=None,
+            band_state=None,
+            display=None,
+            current_monitor=None,
+            announced=False,
+            announcement=None,
+            announce_refused=None,
+            remote_pause_seen=False,
+            remote_cancel_seen=False,
+        )
         # Defect 1 (halt surfacing): every `HaltedError` this session hits is
         # recorded here (`execute()`), and `hook-computer-use` reads this
         # list on every `tool:post` to inject a standing reminder into the
@@ -437,14 +544,6 @@ class ComputerTool:
         # session; a session in which a halt fired stays flagged for the
         # rest of that session, on purpose (see hook module docstring).
         self.halt_notices: list[dict[str, Any]] = []
-        # Cached once so the hot path (`_run`, the `type` action) never pays
-        # an `inspect.signature` call per keystroke - only backends that
-        # accept `type_text(text, guard=...)` (Linux X11 today) get
-        # per-keystroke intra-op detection; others fall back to plain
-        # `type_text(text)`, unaffected.
-        self._backend_type_text_supports_guard: bool = (
-            "guard" in inspect.signature(backend.type_text).parameters
-        )
 
         # -- type_text pacing (measured safety gap, see type_pacing.py) ------
         # `None` (default) = auto: `type_pacing.AUTO_PACING_MS` when a
@@ -470,6 +569,145 @@ class ComputerTool:
                 )
             self._type_pacing_ms = parsed_pacing
 
+    # -- M4 binding properties (docs/designs/capability-awareness.md \u00a76) ------
+    # Every field below lives on `self._binding` (see `_Binding`'s docstring).
+    # Each property is sugar for a SINGLE-FIELD `dataclasses.replace()` -
+    # kept so every existing reader (`self._backend`) and every existing
+    # single-field writer (`mount()`'s `computer._coexistence_guard = ...`,
+    # `_ensure_announced`'s `self._announced = True`, and test fixtures
+    # across this bundle's test suite) keeps working completely unchanged.
+    # `retarget()` itself never goes through these setters for its own
+    # atomic swap - it builds one whole `_Binding` off to the side and
+    # assigns `self._binding = new` exactly once; that single assignment,
+    # not these properties, is what makes the swap atomic.
+    @property
+    def _backend(self) -> Backend:
+        return self._binding.backend
+
+    @_backend.setter
+    def _backend(self, value: Backend) -> None:
+        self._binding = replace(self._binding, backend=value)
+
+    @property
+    def _is_remote(self) -> bool:
+        return self._binding.is_remote
+
+    @_is_remote.setter
+    def _is_remote(self, value: bool) -> None:
+        self._binding = replace(self._binding, is_remote=value)
+
+    @property
+    def _read_only(self) -> bool:
+        return self._binding.read_only
+
+    @_read_only.setter
+    def _read_only(self, value: bool) -> None:
+        self._binding = replace(self._binding, read_only=value)
+
+    @property
+    def _gate_writes(self) -> bool:
+        return self._binding.gate_writes
+
+    @_gate_writes.setter
+    def _gate_writes(self, value: bool) -> None:
+        self._binding = replace(self._binding, gate_writes=value)
+
+    @property
+    def _clipboard_read_policy(self) -> str:
+        return self._binding.clipboard_read_policy
+
+    @_clipboard_read_policy.setter
+    def _clipboard_read_policy(self, value: str) -> None:
+        self._binding = replace(self._binding, clipboard_read_policy=value)
+
+    @property
+    def _coexistence_guard(self) -> CoexistenceGuard | None:
+        return self._binding.coexistence_guard
+
+    @_coexistence_guard.setter
+    def _coexistence_guard(self, value: CoexistenceGuard | None) -> None:
+        self._binding = replace(self._binding, coexistence_guard=value)
+
+    @property
+    def _channel_key(self) -> str | None:
+        return self._binding.channel_key
+
+    @_channel_key.setter
+    def _channel_key(self, value: str | None) -> None:
+        self._binding = replace(self._binding, channel_key=value)
+
+    @property
+    def _ledger(self) -> HeldInputLedger | None:
+        return self._binding.ledger
+
+    @_ledger.setter
+    def _ledger(self, value: HeldInputLedger | None) -> None:
+        self._binding = replace(self._binding, ledger=value)
+
+    @property
+    def _band_state(self) -> _ChannelBandState | None:
+        return self._binding.band_state
+
+    @_band_state.setter
+    def _band_state(self, value: _ChannelBandState | None) -> None:
+        self._binding = replace(self._binding, band_state=value)
+
+    @property
+    def _display(self) -> Display | None:
+        return self._binding.display
+
+    @_display.setter
+    def _display(self, value: Display | None) -> None:
+        self._binding = replace(self._binding, display=value)
+
+    @property
+    def _current_monitor(self) -> MonitorInfo | None:
+        return self._binding.current_monitor
+
+    @_current_monitor.setter
+    def _current_monitor(self, value: MonitorInfo | None) -> None:
+        self._binding = replace(self._binding, current_monitor=value)
+
+    @property
+    def _announced(self) -> bool:
+        return self._binding.announced
+
+    @_announced.setter
+    def _announced(self, value: bool) -> None:
+        self._binding = replace(self._binding, announced=value)
+
+    @property
+    def _announcement(self) -> Any | None:
+        return self._binding.announcement
+
+    @_announcement.setter
+    def _announcement(self, value: Any | None) -> None:
+        self._binding = replace(self._binding, announcement=value)
+
+    @property
+    def _announce_refused(self) -> AnnouncementRefused | None:
+        return self._binding.announce_refused
+
+    @_announce_refused.setter
+    def _announce_refused(self, value: AnnouncementRefused | None) -> None:
+        self._binding = replace(self._binding, announce_refused=value)
+
+    @property
+    def _remote_pause_seen(self) -> bool:
+        return self._binding.remote_pause_seen
+
+    @_remote_pause_seen.setter
+    def _remote_pause_seen(self, value: bool) -> None:
+        self._binding = replace(self._binding, remote_pause_seen=value)
+
+    @property
+    def _remote_cancel_seen(self) -> bool:
+        return self._binding.remote_cancel_seen
+
+    @_remote_cancel_seen.setter
+    def _remote_cancel_seen(self, value: bool) -> None:
+        self._binding = replace(self._binding, remote_cancel_seen=value)
+
     # -- display resolution (D2) -------------------------------------------------
     def resolve_display(self, refresh: bool = False) -> Display:
         """Resolve and cache display geometry for the current target monitor.
@@ -482,22 +720,43 @@ class ComputerTool:
         """
         if self._display is not None and not refresh:
             return self._display
-        self._display = self._resolve_display_for_target(
+        disp, monitor = self._resolve_display_for_target(
             self._target_monitor, allow_fallback=not self._target_monitor_explicit
         )
-        return self._display
+        # One `replace()`, not two property assignments - `display` and
+        # `current_monitor` describe the SAME resolution and always change
+        # together (matches `_Binding`'s own field grouping).
+        self._binding = replace(self._binding, display=disp, current_monitor=monitor)
+        return disp
 
     def _resolve_display_for_target(
-        self, target: str, allow_fallback: bool = False
-    ) -> Display:
-        """Build a `Display` scoped to `target` and record which monitor (if any)
-        is now active in `self._current_monitor`.
+        self,
+        target: str,
+        allow_fallback: bool = False,
+        *,
+        backend: Backend | None = None,
+    ) -> tuple[Display, MonitorInfo | None]:
+        """Build a `Display` scoped to `target` against `backend` (defaults to
+        `self._backend`) and return `(Display, MonitorInfo | None)` - the
+        caller decides how/whether to install the result.
 
         Single shared implementation for both `resolve_display()` (mount time and
         the `screen_info` refresh path) and `select_monitor()` (runtime target
         switch) - one place computes monitor-scoped geometry, so there is no
         separate "switch monitor" code path that could drift out of sync with how
         mount-time resolution works.
+
+        Takes an explicit `backend` (M4, docs/designs/capability-awareness.md
+        \u00a76.2 step 6) rather than always reading `self._backend`, and returns
+        the resolved monitor instead of writing `self._current_monitor`
+        directly, for the same reason: `retarget()`'s build phase must be able
+        to resolve display geometry for a NEW backend this instance has not
+        adopted yet, without touching `self` at all until the swap. The
+        `self._monitors` refresh-cache side effect below is therefore scoped
+        to calls against THIS instance's own current backend only - resolving
+        for a not-yet-adopted backend must never clobber the cache the
+        CURRENT backend's `list_windows`/`focus_window` attribution still
+        relies on mid-build.
 
         `allow_fallback` governs exactly one failure mode: monitor enumeration
         being genuinely unavailable (`Backend.list_monitors()` raising
@@ -520,14 +779,15 @@ class ComputerTool:
         a config typo must never silently degrade to a different region of the
         real, multi-monitor desktop it was supposed to protect against.
         """
+        target_backend = self._backend if backend is None else backend
         if target == VIRTUAL_DESKTOP:
-            geo = self._backend.screen_geometry()
-            self._current_monitor = None
+            geo = target_backend.screen_geometry()
+            current_monitor: MonitorInfo | None = None
             origin_x, origin_y = geo.origin_x, geo.origin_y
             width, height = geo.width, geo.height
         else:
             try:
-                monitors = self._backend.list_monitors()
+                monitors = target_backend.list_monitors()
             except BackendError as exc:
                 if not allow_fallback:
                     raise
@@ -541,8 +801,11 @@ class ComputerTool:
                     target,
                     exc,
                 )
-                return self._resolve_display_for_target(VIRTUAL_DESKTOP)
-            self._monitors = monitors
+                return self._resolve_display_for_target(
+                    VIRTUAL_DESKTOP, backend=backend
+                )
+            if target_backend is self._backend:
+                self._monitors = monitors
             # `select_monitor` (the module-level function) always fails loud on
             # an unmatched explicit id - deliberately NOT gated by
             # allow_fallback. Enumeration succeeding but not containing the
@@ -565,7 +828,7 @@ class ComputerTool:
                     chosen.x,
                     chosen.y,
                 )
-            self._current_monitor = chosen
+            current_monitor = chosen
             origin_x, origin_y = chosen.x, chosen.y
             width, height = chosen.width, chosen.height
 
@@ -581,7 +844,7 @@ class ComputerTool:
             mw,
             mh,
         )
-        return disp
+        return disp, current_monitor
 
     def list_monitors(self) -> list[MonitorInfo]:
         """Enumerate monitors via the backend, refreshing the cached list.
@@ -592,7 +855,9 @@ class ComputerTool:
         self._monitors = self._backend.list_monitors()
         return self._monitors
 
-    def _monitors_for_attribution(self) -> list[MonitorInfo]:
+    def _monitors_for_attribution(
+        self, binding: _Binding | None = None
+    ) -> list[MonitorInfo]:
         """Best-effort monitor list for `monitors.attribute_monitor`, used by
         the `list_windows`/`focus_window` actions below.
 
@@ -603,13 +868,25 @@ class ComputerTool:
         enumeration failure degrades attribution to "unknown" for each window
         (`attribute_monitor` already returns `None` on an empty list), it
         does not make `list_windows`/`focus_window` themselves fail.
+
+        `binding`: council re-review Finding 3 - `_run` dispatches every
+        action against ONE pinned `_Binding` snapshot (see that method's
+        docstring for why); this call used to read `self._backend` fresh
+        instead, which can observe a DIFFERENT backend than the one the
+        action itself just ran against if a `retarget()` lands mid-call.
+        Defaults to a fresh `self._binding` read when not given (direct
+        callers with no snapshot of their own to stay pinned to, e.g.
+        `list_monitors()`/existing tests).
         """
+        binding = binding if binding is not None else self._binding
         try:
-            return self._backend.list_monitors()
+            return binding.backend.list_monitors()
         except BackendError:
             return self._monitors
 
-    def _focus_monitor_warning(self, handle: str) -> str:
+    def _focus_monitor_warning(
+        self, handle: str, binding: _Binding | None = None
+    ) -> str:
         """After `focus_window`, tell the caller - explicitly, in the result
         text - if the window it just raised is on a DIFFERENT monitor than
         the one `computer` currently captures.
@@ -631,17 +908,25 @@ class ComputerTool:
         warning a few lines up (`_run`'s `cursor_position` branch): inform,
         never silently substitute.
 
+        `binding`: council re-review Finding 3, same rationale as
+        `_monitors_for_attribution` above - pin to the SAME snapshot
+        `_run` already dispatched `focus_window` against, rather than
+        re-reading `self._backend`/`self._current_monitor` fresh right
+        after a guarded write. Defaults to a fresh `self._binding` read
+        when not given.
+
         Returns `""` (no note) when: this session is in virtual-desktop mode
-        (`self._current_monitor is None` - capture already shows the whole
+        (`binding.current_monitor is None` - capture already shows the whole
         desktop, so there is nothing to warn about); the window landed on the
         SAME monitor `computer` is already scoped to; or fresh window
         enumeration itself fails (cannot verify either way - say nothing
         false rather than fabricate a warning).
         """
-        if self._current_monitor is None:
+        binding = binding if binding is not None else self._binding
+        if binding.current_monitor is None:
             return ""
         try:
-            result = self._backend.list_windows()
+            result = binding.backend.list_windows()
         except BackendError:
             return ""
         entry = next((w for w in result.windows if w.handle == handle), None)
@@ -652,8 +937,8 @@ class ComputerTool:
                 "it; take a screenshot to confirm the focus actually landed "
                 "where expected]"
             )
-        target = self._current_monitor.id
-        landed = attribute_monitor(entry.rect, self._monitors_for_attribution())
+        target = binding.current_monitor.id
+        landed = attribute_monitor(entry.rect, self._monitors_for_attribution(binding))
         if landed == target:
             return ""
         if landed is None:
@@ -691,10 +976,11 @@ class ComputerTool:
         (config or a live `desktop.select_monitor` call) is entitled to know it
         failed, not have it silently ignored in favor of the previous target.
         """
-        self._display = self._resolve_display_for_target(target, allow_fallback=False)
+        disp, monitor = self._resolve_display_for_target(target, allow_fallback=False)
+        self._binding = replace(self._binding, display=disp, current_monitor=monitor)
         self._target_monitor = target
         self._target_monitor_explicit = True
-        return self._display
+        return disp
 
     @property
     def display(self) -> Display:
@@ -916,7 +1202,12 @@ class ComputerTool:
 
     # -- coexistence guard wiring for every mutating action ----------------------
     @contextmanager
-    def _guard_write(self, *, coord: tuple[int, int] | None = None):
+    def _guard_write(
+        self,
+        *,
+        coord: tuple[int, int] | None = None,
+        binding: _Binding | None = None,
+    ):
         """Wrap one mutating action in the coexistence guard's before/after
         discipline (`docs/designs/coexistence.md` \u00a75.2/\u00a78.6), extended in
         this pass from `type_text` (the only action guarded before) to every
@@ -942,12 +1233,23 @@ class ComputerTool:
         behavior before this pass) when no guard exists for this backend/
         platform (`self._coexistence_guard is None` - e.g. Windows, or any
         platform with coexistence explicitly disabled).
+
+        `binding`: the pinned `_Binding` snapshot `_run` is already
+        dispatching this action against (see `_run`'s own docstring) - the
+        policy-bypass race fix: the guard resolved here must be the SAME
+        one that belongs to the backend `_run` is about to call, never a
+        fresh `self._coexistence_guard` re-read that a concurrent
+        `retarget()` could have already swapped out from under it. Defaults
+        to a fresh `self._binding` read for callers with no pinned snapshot
+        of their own (existing tests that call `_guard_write`/`_run`
+        directly, outside `_execute_calls`).
         """
-        guard = self._coexistence_guard
+        binding = binding if binding is not None else self._binding
+        guard = binding.coexistence_guard
         if guard is None:
             yield
             return
-        if self._is_remote and self._announcement is not None:
+        if binding.is_remote and binding.announcement is not None:
             self._sync_remote_announcement_state(guard)
         guard.check_start_permission()
         guard.bind_target()
@@ -962,7 +1264,13 @@ class ComputerTool:
     # -- finding #1: `HeldInputLedger.hold()` used to be called ONLY from
     # -- `remote_agent.py` - a local `left_mouse_down` had zero enforcement:
     # -- no deadman, no release on halt/pause/cancel/target-change) ---------
-    def _hold_mouse_button(self, button: str, backend: Backend) -> None:
+    def _hold_mouse_button(
+        self,
+        button: str,
+        backend: Backend,
+        *,
+        ledger: HeldInputLedger | None = None,
+    ) -> None:
         """Register a just-pressed mouse button in the channel-scoped held-
         input ledger. Mirrors `RemoteAgent._op_mouse_down`'s pattern exactly
         (`remote_agent.py`): the release_fn reads its coordinates out of a
@@ -975,8 +1283,13 @@ class ComputerTool:
         A no-op when this backend has no channel-scoped ledger (no
         coexistence guard was built for it - \\u00a75.5's \"never claim a
         guarantee you don't have\").
+
+        `ledger`: the pinned binding's ledger (see `_run`'s docstring) -
+        defaults to a fresh `self._ledger` read for callers with no pinned
+        snapshot of their own.
         """
-        if self._ledger is None:
+        ledger = ledger if ledger is not None else self._ledger
+        if ledger is None:
             return
         token = f"mouse:{button}"
         pending: dict[str, int | None] = {"x": None, "y": None}
@@ -986,10 +1299,16 @@ class ComputerTool:
             backend.mouse_up(pending["x"], pending["y"], button)
             self._mouse_pending.pop(token, None)
 
-        self._ledger.hold("mouse", token, _release)
+        ledger.hold("mouse", token, _release)
 
     def _release_mouse_button(
-        self, button: str, backend: Backend, x: int | None, y: int | None
+        self,
+        button: str,
+        backend: Backend,
+        x: int | None,
+        y: int | None,
+        *,
+        ledger: HeldInputLedger | None = None,
     ) -> None:
         """Counterpart to `_hold_mouse_button`. When a matching hold is
         tracked, release THROUGH the ledger (after updating the pending box
@@ -999,12 +1318,17 @@ class ComputerTool:
         nothing is tracked (no ledger, or no matching down - e.g. `read_only`
         was toggled mid-session) - identical fallback to
         `RemoteAgent._op_mouse_up`.
+
+        `ledger`: the pinned binding's ledger (see `_run`'s docstring) -
+        defaults to a fresh `self._ledger` read for callers with no pinned
+        snapshot of their own.
         """
+        ledger = ledger if ledger is not None else self._ledger
         token = f"mouse:{button}"
         pending = self._mouse_pending.get(token)
-        if self._ledger is not None and pending is not None:
+        if ledger is not None and pending is not None:
             pending["x"], pending["y"] = x, y
-            self._ledger.release(token)
+            ledger.release(token)
         else:
             backend.mouse_up(x, y, button)
 
@@ -1126,22 +1450,38 @@ class ComputerTool:
         "stop driving" structurally, not by convention: no action from
         either tool can reach the backend without passing through here
         first, and once refused this method never again returns normally.
+
+        M4 (docs/designs/capability-awareness.md \u00a76): reads `self._binding`
+        ONCE per check (`binding = self._binding`), never `self._announce_refused`
+        and `self._announced` as two separate attribute reads - see
+        `_Binding`'s own docstring for why that distinction is the whole fix.
+        `retarget()` shares THIS SAME `self._announce_lock` for its own
+        build+swap, so a first-use build here and a concurrent `retarget()`
+        can never both be "in progress" at once: whichever gets the lock
+        first runs to completion (installing a fully-formed, ALREADY-
+        disclosed `_Binding`) before the other can even start, which is what
+        makes this method's unlocked fast-path reads safe against a
+        concurrent retarget, not merely unlikely to lose the race.
         """
-        if self._announce_refused is not None:
-            raise self._announce_refused
-        if self._announced:
+        binding = self._binding
+        if binding.announce_refused is not None:
+            raise binding.announce_refused
+        if binding.announced:
             return
         with self._announce_lock:
-            # Double-checked: another thread may have already announced (or
-            # been refused) while this thread waited for the lock above.
-            if self._announce_refused is not None:
-                raise self._announce_refused
-            if self._announced:
+            # Double-checked: another thread (or a retarget) may have
+            # already announced (or been refused, or installed an entirely
+            # new binding) while this thread waited for the lock above -
+            # re-read rather than trust the snapshot taken before it.
+            binding = self._binding
+            if binding.announce_refused is not None:
+                raise binding.announce_refused
+            if binding.announced:
                 return
             try:
-                self._announcement = _build_announcement(
-                    self._backend,
-                    self._coexistence_guard,
+                handle = _build_announcement(
+                    binding.backend,
+                    binding.coexistence_guard,
                     self._cfg,
                     self.resolve_display(),
                 )
@@ -1154,7 +1494,7 @@ class ComputerTool:
                 # a connection a different, already-consented session is
                 # using against the same target.
                 try:
-                    self._backend.close()
+                    binding.backend.close()
                 except Exception:  # noqa: BLE001 - best-effort cleanup on refusal
                     logger.debug(
                         "tool-computer-use: backend.close() failed after a "
@@ -1162,7 +1502,375 @@ class ComputerTool:
                         exc_info=True,
                     )
                 raise
+            self._announcement = handle
             self._announced = True
+
+    # -- M4: live re-target (docs/designs/capability-awareness.md \u00a76) --------
+    def retarget(self, target: str | None) -> ToolResult:
+        """`desktop(action="retarget")` - switch which machine this session
+        drives, mid-conversation, without restarting. \u00a76.2's sequence:
+        build the WHOLE new binding (connect, guard, disclosure, policy,
+        display) before touching anything this session currently uses,
+        then replace `self._binding` with ONE atomic reference assignment
+        (see `_Binding`'s own docstring for why that - not a convenience -
+        is the fix for the verified race). Any failure before the swap
+        leaves the CURRENT binding exactly as it was; never a partial
+        retarget.
+
+        `target`: `"ssh://user@host[:port]"` to switch to a remote machine,
+        or `"local"` (or falsy/omitted) to switch back to whatever local
+        backend this machine can serve. Takes NO other arguments - \u00a76.6:
+        this is a machine-selection mechanism, not a policy-escalation one.
+        `read_only`/`gate_writes`/`clipboard_read_policy` are always
+        recomputed from the SAME mount-time config, against the new
+        target's remoteness, exactly like `__init__` does at mount.
+        """
+        normalized = str(target).strip() if target else ""
+        new_cfg = dict(self._cfg)
+        if normalized and normalized != "local":
+            new_cfg["target"] = normalized
+        else:
+            new_cfg.pop("target", None)
+
+        # Step 0 (\u00a76.2): REFUSE-IF-BUSY. Reusing `_announce_lock` (rather
+        # than a second lock) for the "is a disclosure decision already
+        # being built" half of this is what makes the verified race
+        # structurally impossible - see `_ensure_announced`'s docstring.
+        # Non-blocking: a busy channel means genuinely busy right now: fail
+        # loud and let the caller retry, rather than block this tool call
+        # for up to 30s behind someone else's dialog/connect.
+        if not self._announce_lock.acquire(blocking=False):
+            return ToolResult(
+                success=False,
+                error={
+                    "message": (
+                        "retarget refused: a disclosure/announcement decision "
+                        "is already being built for this session (its first "
+                        "real action, or another retarget) - retry once it "
+                        "completes"
+                    ),
+                    "type": "RetargetRefused",
+                },
+            )
+        try:
+            current = self._binding
+            # Second TOCTOU fix: this read used to be unlocked
+            # (`current.band_state.depth != 0`) while `_band_enter`/
+            # `_band_exit` only ever mutate `depth` under `state.lock` - an
+            # unlocked reader here could race a concurrent increment/
+            # decrement and observe a torn/stale value. Read it under the
+            # SAME lock those two methods use.
+            #
+            # Labeling correction (council re-review): a prior round of this
+            # fix was described as having "eliminated" band-depth tracking's
+            # role here. That framing was wrong - nothing about band-depth
+            # tracking was eliminated. It still exists, unchanged, right
+            # below, and is still consulted here: a lens correctly objected,
+            # "nothing was eliminated, it survived, and grew a lock and a
+            # paragraph" (the TOCTOU lock fix above and this very comment).
+            #
+            # What WAS eliminated is narrower and precise: the policy-bypass
+            # race's fix no longer DEPENDS on band-depth tracking for
+            # correctness. This check is a BUSY-REFUSAL COURTESY, not the
+            # safety mechanism that prevents the race: band-depth tracking
+            # only ever engages for a LOCAL Linux-X11/Windows overlay (see
+            # `_live_band_handle`) - it is `None`/never-incremented for
+            # macOS and for every REMOTE target, i.e. for most of what M4
+            # retarget exists to reach. Making this check airtight would
+            # still leave every other platform unprotected. The actual fix
+            # for the policy-bypass race is the single-snapshot discipline
+            # in `_execute_calls`/`_run` (see those methods' docstrings) -
+            # deliberately made independent of this counter's availability,
+            # rather than extending band-depth tracking to every platform/
+            # remote target (a materially larger change - a new wire
+            # control op for remote raise/lower, per `_live_band_handle`'s
+            # own docstring - for no correctness benefit once the snapshot
+            # discipline holds on its own).
+            band_state = current.band_state
+            if band_state is not None:
+                with band_state.lock:
+                    depth = band_state.depth
+                if depth != 0:
+                    return ToolResult(
+                        success=False,
+                        error={
+                            "message": (
+                                f"retarget refused: {depth} "
+                                "action(s) currently in flight against the "
+                                "current binding"
+                            ),
+                            "type": "RetargetRefused",
+                        },
+                    )
+            if current.ledger is not None and current.ledger.held_tokens:
+                return ToolResult(
+                    success=False,
+                    error={
+                        "message": (
+                            "retarget refused: input still held on the "
+                            f"current binding ({current.ledger.held_tokens!r}) "
+                            "- release it (or let it release) before "
+                            "switching targets"
+                        ),
+                        "type": "RetargetRefused",
+                    },
+                )
+
+            # Step 1 (\u00a76.2): PARSE + BUILD - connect + handshake. Any
+            # failure here leaves the CURRENT binding completely untouched -
+            # nothing has been built yet to release.
+            try:
+                new_backend = select_backend(new_cfg)
+            except (NoBackendAvailable, ValueError, TypeError) as exc:
+                return ToolResult(
+                    success=False,
+                    error={
+                        "message": f"retarget refused: {exc}",
+                        "type": type(exc).__name__,
+                    },
+                )
+            except Exception as exc:
+                # Same pattern `mount()` uses: `select_backend`'s remote
+                # branch raises `RemoteTargetUnavailable` for an explicit,
+                # unreachable target, deliberately NOT as `NoBackendAvailable`
+                # - it must never be silently swallowed into a fallback.
+                from .remote_backend import RemoteTargetUnavailable
+
+                if not isinstance(exc, RemoteTargetUnavailable):
+                    raise
+                return ToolResult(
+                    success=False,
+                    error={
+                        "message": f"retarget refused: {exc}",
+                        "type": type(exc).__name__,
+                    },
+                )
+
+            # Same-channel short circuit (\u00a76.5: "Same target as current ->
+            # No-op, reported as such. Never silently re-disclose") -
+            # computed from the actual CONNECTED backend's identity, not
+            # the requested string, so two differently-spelled targets that
+            # resolve to the same physical machine are still recognized
+            # (matches `_channel_identity`'s own reasoning). Release the
+            # extra connection this probe just opened (refcounted - see
+            # `_build_ssh_transport`; a no-op for local backends) and
+            # return without touching anything else.
+            if _channel_identity(new_backend) == _channel_identity(current.backend):
+                try:
+                    new_backend.close()
+                except Exception:  # noqa: BLE001 - best-effort
+                    logger.debug(
+                        "computer-use: new_backend.close() failed after a "
+                        "same-target retarget no-op",
+                        exc_info=True,
+                    )
+                return ToolResult(
+                    success=True,
+                    output=(
+                        f"retarget no-op: already targeting {current.backend.name!r}"
+                    ),
+                )
+
+            try:
+                # Step 2 (\u00a76.2): GUARD.
+                new_guard = _build_coexistence_guard(new_backend, new_cfg)
+                new_coexistence_cfg = dict(new_cfg.get("coexistence") or {})
+                if new_guard is None:
+                    if bool(new_coexistence_cfg.get("retarget_allow_no_guard", False)):
+                        logger.warning(
+                            "computer-use: retarget to %r proceeding with NO "
+                            "coexistence guard (coexistence."
+                            "retarget_allow_no_guard override) - no halt "
+                            "protection, no disclosure channel",
+                            new_backend.name,
+                        )
+                    else:
+                        # \u00a76.5: a mid-session downgrade of an already-
+                        # protected session to a target with no presence
+                        # detector at all is silent degradation by default -
+                        # refuse, the same explicit/logged opt-out shape
+                        # \u00a77.6 already uses for `drive_anyway`.
+                        raise _RetargetRefused(
+                            f"retarget refused: no coexistence guard could be "
+                            f"built for {new_backend.name!r} - this target has "
+                            "no proven presence-detector wiring, and switching "
+                            "to it mid-session would silently remove halt "
+                            "protection and the disclosure channel for an "
+                            "already-protected session (docs/designs/"
+                            "capability-awareness.md \u00a76.5). Set "
+                            "coexistence.retarget_allow_no_guard=true to "
+                            "override - logged every time it fires."
+                        )
+                new_channel_key = _channel_identity(new_backend)
+                new_ledger = _get_channel_ledger(new_channel_key)
+                new_band_state = _get_channel_band_state(new_channel_key)
+
+                # Step 3 (\u00a76.2): MOUNT-TIME REFUSAL - the same check
+                # `mount()` itself runs, against the NEW backend.
+                refusal = _refuse_if_disclosure_declined_with_human_present(
+                    new_coexistence_cfg, new_guard, new_backend
+                )
+                if refusal is not None:
+                    raise _RetargetRefused(f"retarget refused: {refusal}")
+
+                # Step 6 (\u00a76.2), computed here (before DISCLOSE) so a
+                # display-resolution failure never leaves an already-shown
+                # dialog/overlay with nothing to release but the backend
+                # (\u00a76.4: never hide/tear down an announcement handle here -
+                # it may be a SHARED channel a different consumer already
+                # relies on; only `new_backend.close()` is ever safe to call
+                # unconditionally on failure - see that call's own comment
+                # in the exception handler below).
+                new_display, new_monitor = self._resolve_display_for_target(
+                    self._target_monitor,
+                    allow_fallback=not self._target_monitor_explicit,
+                    backend=new_backend,
+                )
+
+                # Step 4 (\u00a76.2): DISCLOSE - may show a dialog / raise an
+                # overlay on the NEW target. `AnnouncementRefused` propagates
+                # (caught below); the old binding is untouched either way.
+                new_handle = _build_announcement(
+                    new_backend, new_guard, new_cfg, new_display
+                )
+
+                # Step 5 (\u00a76.2): POLICY - recomputed from the SAME config,
+                # against the NEW target's remoteness. Identical rules to
+                # `__init__` - kept in sync deliberately (\u00a76.6: retarget is
+                # not a way to widen policy; explicit config still wins,
+                # exactly like mount).
+                new_is_remote = bool(getattr(new_backend, "is_remote", False))
+                read_only_cfg = new_cfg.get("read_only")
+                new_read_only = (
+                    new_is_remote if read_only_cfg is None else bool(read_only_cfg)
+                )
+                gate_cfg = new_cfg.get("gate_writes")
+                if gate_cfg is None:
+                    new_gate_writes = new_is_remote and not new_read_only
+                else:
+                    new_gate_writes = bool(gate_cfg)
+                clipboard_cfg = new_cfg.get("clipboard_read_policy")
+                if clipboard_cfg is None:
+                    new_clipboard_policy = "redact" if new_is_remote else "allow"
+                else:
+                    new_clipboard_policy = str(clipboard_cfg)
+            except AnnouncementRefused as exc:
+                try:
+                    new_backend.close()
+                except Exception:  # noqa: BLE001 - best-effort cleanup on refusal
+                    logger.debug(
+                        "computer-use: new_backend.close() failed after a "
+                        "retarget disclosure refusal",
+                        exc_info=True,
+                    )
+                return ToolResult(
+                    success=False,
+                    error={"message": str(exc), "type": "AnnouncementRefused"},
+                )
+            except _RetargetRefused as exc:
+                try:
+                    new_backend.close()
+                except Exception:  # noqa: BLE001 - best-effort cleanup on refusal
+                    logger.debug(
+                        "computer-use: new_backend.close() failed after a "
+                        "retarget refusal",
+                        exc_info=True,
+                    )
+                return ToolResult(
+                    success=False,
+                    error={"message": str(exc), "type": "RetargetRefused"},
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Anything else that fails between BUILD and the commit
+                # point below (a guard helper raising, display resolution
+                # raising, ...): release the half-built new backend -
+                # refcounted, so this NEVER tears down a DIFFERENT
+                # consumer's connection to the same target, see
+                # `RemoteBackend.close`/`shared_transport.py` - and leave
+                # the CURRENT binding exactly as it was. Never hide/release
+                # `new_handle` here even if one was already built above:
+                # \u00a76.4's own rule ("release, never destroy") applies with
+                # equal force to a FAILED retarget - the handle may be a
+                # cached, SHARED channel a different session is already
+                # relying on.
+                try:
+                    new_backend.close()
+                except Exception:  # noqa: BLE001 - best-effort cleanup on failure
+                    logger.debug(
+                        "computer-use: new_backend.close() failed while "
+                        "cleaning up a failed retarget",
+                        exc_info=True,
+                    )
+                logger.exception(
+                    "computer-use: retarget to %r failed", normalized or "local"
+                )
+                return ToolResult(
+                    success=False,
+                    error={
+                        "message": f"retarget failed: {exc}",
+                        "type": type(exc).__name__,
+                    },
+                )
+
+            # --- commit point (\u00a76.2): nothing above this line has touched
+            # the current binding -------------------------------------------
+            new_binding = _Binding(
+                backend=new_backend,
+                is_remote=new_is_remote,
+                read_only=new_read_only,
+                gate_writes=new_gate_writes,
+                clipboard_read_policy=new_clipboard_policy,
+                coexistence_guard=new_guard,
+                channel_key=new_channel_key,
+                ledger=new_ledger,
+                band_state=new_band_state,
+                display=new_display,
+                current_monitor=new_monitor,
+                announced=True,
+                announcement=new_handle,
+                announce_refused=None,
+                remote_pause_seen=False,
+                remote_cancel_seen=False,
+            )
+            old = self._binding
+            # Step 7 (\u00a76.2): SWAP - the fix the review named: ONE atomic
+            # reference assignment, never a field at a time. A reader can
+            # only ever observe the OLD binding whole or the NEW binding
+            # whole (see `_Binding`'s docstring).
+            self._binding = new_binding
+            self._cfg = new_cfg
+            self._monitors = []
+            # Step 8 (\u00a76.2): RELEASE OLD - release this session's OWN
+            # reference, never the channel itself (\u00a76.4: a delegated child,
+            # or a second tool config, may still be driving the SAME old
+            # channel through the SAME shared handle - `close()` only
+            # decrements THIS handle's refcount).
+            try:
+                old.backend.close()
+            except Exception:  # noqa: BLE001 - best-effort
+                logger.debug(
+                    "computer-use: old_backend.close() failed after a "
+                    "successful retarget",
+                    exc_info=True,
+                )
+            logger.info(
+                "computer-use: retargeted from %r to %r",
+                old.backend.name,
+                new_backend.name,
+            )
+            return ToolResult(
+                success=True,
+                output=json.dumps(
+                    {
+                        "retargeted_to": new_backend.name,
+                        "is_remote": new_is_remote,
+                        "user_host": getattr(new_backend, "user_host", None),
+                    },
+                    default=str,
+                ),
+            )
+        finally:
+            self._announce_lock.release()
 
     # -- band lifetime (docs/designs/band-lifetime.md, Alt A - \u00a711.1) --------
     # Scopes the Linux/Windows disclosure band's lifetime to actual activity
@@ -1278,15 +1986,69 @@ class ComputerTool:
             handle.hide()
 
     # -- execution --------------------------------------------------------------
-    def _run(self, action: str, params: dict[str, Any]) -> tuple[str, str | None]:
-        """Run one Anthropic computer-tool action against `self._backend`.
+    def _run(
+        self,
+        action: str,
+        params: dict[str, Any],
+        *,
+        binding: _Binding | None = None,
+    ) -> tuple[str, str | None]:
+        """Run one Anthropic computer-tool action against a backend.
 
         Returns (text_summary, base64_png_or_None). Mirrors the dispatch logic that
         used to live inside `WindowsBridge.execute` - now backend-agnostic: it only
         ever calls the `Backend` protocol, never a concrete backend's internals.
+
+        `binding`: the fix for a six-lens council's verified policy-bypass
+        race - a lens's standalone repro against unmodified production code
+        reproduced it on the first try: a MUTATING action's `read_only`
+        check (in `_execute_calls`) passed under the OLD, permissive
+        binding, but by the time this method went on to read `self._backend`
+        a moment later, a concurrent `retarget()` had already swapped in a
+        NEW, restrictive binding - and the write landed on the NEW target
+        anyway, having been checked against a binding that no longer
+        applied. The fix: the caller (`_execute_calls`/
+        `DesktopTool._execute_action`) reads `self._binding` ONCE, BEFORE
+        its own check, and passes that SAME object here - so the check and
+        every backend/guard/display access this call makes are pinned to
+        one atomic-view snapshot, and a `retarget()` swap that lands
+        anywhere during this call can never change what it dispatches
+        against. This now includes `list_windows`/`focus_window`'s monitor
+        attribution (`_monitors_for_attribution`/`_focus_monitor_warning`,
+        both take this SAME `binding`) and `type`'s guard-support check
+        (derived fresh from `binding.backend` on every call, never cached
+        from a backend a `retarget()` may have since replaced) - council
+        re-review Findings 1 and 3 named both as reads that used to bypass
+        the pin. Defaults to a fresh, single `self._binding` read when not
+        given (existing tests that call `_run(...)` directly, with no check
+        of their own to keep in sync) - there is no check to straddle in
+        that case, but a single fresh read here still fixes this method's
+        own former internal inconsistency (`disp = self.display` and
+        `backend = self._backend` used to be two SEPARATE `self._binding`
+        reads, themselves racy against a retarget landing between them).
+
+        Two reads are DELIBERATELY excluded from the pin, same spirit as
+        `_Binding`'s own `_mouse_pending` exclusion - named here rather
+        than left for the claim above to be read as unqualified:
+        `screen_info`'s `self.resolve_display(refresh=True)` call (this
+        action's whole purpose is to report CURRENT geometry, not this
+        call's pinned snapshot - see that branch's own comment), and
+        `_monitors_for_attribution`'s `self._monitors` fallback (a best-
+        effort cache used only when live enumeration fails right now,
+        degrading attribution to "unknown" rather than affecting anything
+        this method actually dispatches against).
         """
-        disp = self.display
-        backend = self._backend
+        binding = binding if binding is not None else self._binding
+        if binding.display is None:
+            # Same fail-loud contract as the `display` property (mount()
+            # resolves eagerly; this should never happen in practice) - not
+            # bypassed just because this reads `binding` instead of the
+            # property now.
+            raise BackendError(
+                "display geometry not resolved; resolve_display() must be called at mount time"
+            )
+        disp = binding.display
+        backend = binding.backend
 
         def coord(key: str = "coordinate") -> tuple[int, int]:
             raw = params.get(key)
@@ -1304,8 +2066,8 @@ class ComputerTool:
             # downscaled and then implicitly "close enough". `None` here (only in
             # virtual-desktop mode) preserves the original whole-desktop capture.
             region = None
-            if self._current_monitor is not None:
-                m = self._current_monitor
+            if binding.current_monitor is not None:
+                m = binding.current_monitor
                 region = (m.x, m.y, m.x + m.width, m.y + m.height)
             b64 = capture_scaled_b64(
                 backend, disp, region, self._max_edge, self._max_pixels
@@ -1346,8 +2108,8 @@ class ComputerTool:
             sx, sy = backend.cursor_position()
             mx, my = disp.to_model(sx, sy)
             note = ""
-            if self._current_monitor is not None:
-                m = self._current_monitor
+            if binding.current_monitor is not None:
+                m = binding.current_monitor
                 if not (m.x <= sx < m.x + m.width and m.y <= sy < m.y + m.height):
                     # Honest, not synthetic: to_model() above already clamped
                     # (sx, sy) to the targeted monitor's edge because the real
@@ -1374,9 +2136,9 @@ class ComputerTool:
                 "origin_y": fresh.origin_y,
                 "target_monitor": self._target_monitor,
             }
-            if self._current_monitor is not None:
-                payload["monitor_id"] = self._current_monitor.id
-                payload["monitor_primary"] = self._current_monitor.primary
+            if binding.current_monitor is not None:
+                payload["monitor_id"] = binding.current_monitor.id
+                payload["monitor_primary"] = binding.current_monitor.primary
             elif self._target_monitor != VIRTUAL_DESKTOP:
                 # Degraded: a per-monitor target was requested but enumeration
                 # was unavailable, so geometry is the whole virtual-desktop
@@ -1397,7 +2159,7 @@ class ComputerTool:
 
         if action == "list_windows":
             result = backend.list_windows()
-            monitors = self._monitors_for_attribution()
+            monitors = self._monitors_for_attribution(binding)
             visible = [w for w in result.windows if not w.minimized][:25]
             lines = []
             for w in visible:
@@ -1410,16 +2172,17 @@ class ComputerTool:
             handle = params.get("handle")
             if not handle:
                 raise ValueError("action 'focus_window' requires 'handle'")
-            with self._guard_write():
+            with self._guard_write(binding=binding):
                 backend.focus_window(str(handle))
-            note = self._focus_monitor_warning(str(handle))
+            note = self._focus_monitor_warning(str(handle), binding)
             return f"focused window {handle}{note}", None
 
         if action in _CLICK_ACTIONS:
             button, count = _CLICK_ACTIONS[action]
             x, y = coord() if params.get("coordinate") is not None else (None, None)
             with self._guard_write(
-                coord=(x, y) if x is not None and y is not None else None
+                coord=(x, y) if x is not None and y is not None else None,
+                binding=binding,
             ):
                 backend.click(x, y, button=button, count=count)
             where = (
@@ -1430,25 +2193,27 @@ class ComputerTool:
 
         if action == "mouse_move":
             x, y = coord()
-            with self._guard_write(coord=(x, y)):
+            with self._guard_write(coord=(x, y), binding=binding):
                 backend.move(x, y)
             return f"mouse_move at {params.get('coordinate')}", None
 
         if action == "left_mouse_down":
             x, y = coord() if params.get("coordinate") is not None else (None, None)
             with self._guard_write(
-                coord=(x, y) if x is not None and y is not None else None
+                coord=(x, y) if x is not None and y is not None else None,
+                binding=binding,
             ):
                 backend.mouse_down(x, y, "left")
-                self._hold_mouse_button("left", backend)
+                self._hold_mouse_button("left", backend, ledger=binding.ledger)
             return "left_mouse_down", None
 
         if action == "left_mouse_up":
             x, y = coord() if params.get("coordinate") is not None else (None, None)
             with self._guard_write(
-                coord=(x, y) if x is not None and y is not None else None
+                coord=(x, y) if x is not None and y is not None else None,
+                binding=binding,
             ):
-                self._release_mouse_button("left", backend, x, y)
+                self._release_mouse_button("left", backend, x, y, ledger=binding.ledger)
             return "left_mouse_up", None
 
         if action == "left_click_drag":
@@ -1499,8 +2264,27 @@ class ComputerTool:
             if not text:
                 raise ValueError("action 'type' requires 'text'")
             body = str(text)
-            guard = self._coexistence_guard
-            guard_active = guard is not None and self._backend_type_text_supports_guard
+            guard = binding.coexistence_guard
+            # Council re-review Finding 1: this used to be a `self.X` flag
+            # cached ONCE in `__init__` from the ORIGINAL backend's
+            # `type_text` signature, and never refreshed on retarget -
+            # mount on a backend without a `guard` kwarg (flag caches
+            # `False`), retarget onto one that HAS it and gets a real,
+            # active guard, and the whole check_start_permission()/
+            # bind_target()/pacing sequence below was silently skipped for
+            # `type`, with zero exception and zero log line. Deriving it
+            # HERE, from `binding.backend` (the same single-snapshot pin
+            # every other backend/guard/display access in this method
+            # already uses - see this method's own docstring), closes that
+            # gap: it can never be stale, because it is never cached across
+            # a retarget in the first place. `inspect.signature()` is cheap
+            # (microseconds) and this runs once per `type` action call, not
+            # once per keystroke - the per-keystroke loop below only calls
+            # `backend.type_text` itself.
+            backend_supports_guard = (
+                "guard" in inspect.signature(backend.type_text).parameters
+            )
+            guard_active = guard is not None and backend_supports_guard
             # Measured safety gap (type_pacing.py): a 202-character string
             # typed at full speed via a per-character guarded loop can
             # complete in ~70ms - an inter-character gap far narrower than
@@ -1529,7 +2313,7 @@ class ComputerTool:
                 )
             if guard_active:
                 assert guard is not None
-                if self._is_remote and self._announcement is not None:
+                if binding.is_remote and binding.announcement is not None:
                     self._sync_remote_announcement_state(guard)
                 # \u00a75.2/\u00a78.6: bind the delivery target once at operation
                 # start; `backend.type_text` re-checks it (via the guard)
@@ -1624,7 +2408,18 @@ class ComputerTool:
         """The dialect-read + per-action dispatch loop, unchanged from
         before band-lifetime tracking existed - split out of `execute()`
         only so that method's own `try/finally` around `_band_enter`/
-        `_band_exit` does not have to re-indent this whole body."""
+        `_band_exit` does not have to re-indent this whole body.
+
+        Single-snapshot discipline (the fix for a six-lens council's
+        verified policy-bypass race, reproduced against unmodified
+        production code): `binding = self._binding` is read ONCE per
+        action, BEFORE the `read_only`/`MUTATING` check, and that SAME
+        object is passed into `_run` for the actual dispatch - never a
+        second, later `self._binding` read (via `self._read_only`/
+        `self._backend`/...) that a concurrent `retarget()` could have
+        already swapped. See `_run`'s own docstring for the full rationale
+        and the exact repro this closes.
+        """
         dialect, calls = read_call(input, self.image_space)
 
         last_summary = ""
@@ -1645,7 +2440,11 @@ class ComputerTool:
                             "message": f"unknown action {action!r}; expected one of {', '.join(ACTIONS)}"
                         },
                     )
-                if self._read_only and action in MUTATING:
+                # ONE binding read covering BOTH the policy check below AND
+                # the dispatch (`_run(..., binding=binding)`) - see this
+                # method's own docstring and `_run`'s.
+                binding = self._binding
+                if binding.read_only and action in MUTATING:
                     return ToolResult(
                         success=False,
                         error={
@@ -1662,7 +2461,7 @@ class ComputerTool:
                     # on a microsecond-scale X11/Quartz call costs a thread-pool
                     # round trip, not a network one.
                     summary, image_b64 = await asyncio.to_thread(
-                        self._run, action, params
+                        self._run, action, params, binding=binding
                     )
                 except HaltedError as exc:
                     return self._record_halt_result(action, exc)
@@ -1690,7 +2489,9 @@ class ComputerTool:
                 return ToolResult(success=True, output=last_summary)
             # OpenAI's `computer_call_output` is invalid without an image, so
             # take one more if the batch's own actions produced none - the
-            # model always sees the result of what it just did.
+            # model always sees the result of what it just did. A read
+            # (never gated by `read_only`), so a fresh binding read here
+            # (no check to keep in sync with) is fine.
             try:
                 last_summary, last_image_b64 = await asyncio.to_thread(
                     self._run, "screenshot", {}
@@ -1799,6 +2600,14 @@ DESKTOP_ACTIONS = [
     # one action is dispatched before `_ensure_announced`, and
     # `_build_doctor_report` for the hard content boundary that earns it.
     "doctor",
+    # M4 (docs/designs/capability-awareness.md \u00a76): live re-target - like
+    # `doctor`, dispatched before `_ensure_announced` (see `DesktopTool.
+    # execute`'s comment) because this action's whole job is to establish
+    # disclosure for a NEW target itself (`ComputerTool.retarget`'s own \u00a76.2
+    # steps 3-4); gating it behind the CURRENT/OLD target's disclosure would
+    # show a possibly-irrelevant dialog for a machine the caller is about to
+    # leave.
+    "retarget",
 ]
 
 #: Clipboard *reads* travel to the model provider as tool output (see README Safety
@@ -1934,6 +2743,18 @@ class DesktopTool:
                         "'virtual-desktop' (select_monitor)."
                     ),
                 },
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "New machine for this session to drive (retarget) - "
+                        "'ssh://user@host[:port]' for a remote machine, or "
+                        "'local' to switch back to this machine's own local "
+                        "backend. Takes no other arguments: policy "
+                        "(read_only/gate_writes/clipboard_read_policy) is "
+                        "always recomputed from this session's own config, "
+                        "never widened by a retarget call."
+                    ),
+                },
             },
             "required": ["action"],
         }
@@ -1969,6 +2790,20 @@ class DesktopTool:
         # to", which only has an answer once there is a machine.
         if str(input.get("action") or "").strip() == "doctor":
             return _build_doctor_report(self._computer)
+        # M4 disclosure-gate exemption (docs/designs/capability-awareness.md
+        # \u00a76.1): `retarget` is dispatched BEFORE `_ensure_announced` for the
+        # SAME reason `doctor` is, above - this call's whole job is to
+        # establish disclosure for a NEW target (`ComputerTool.retarget`'s
+        # own \u00a76.2 steps 3-4), and gating it behind the CURRENT/OLD target's
+        # disclosure would show a possibly-irrelevant dialog for a machine
+        # the caller is about to leave, and would violate the "warn before
+        # the dialog" ordering (\u00a78 step 5 vs step 6 of the design doc's
+        # walkthrough) for the identical reason `doctor` cannot go through
+        # this gate either. `retarget` runs on a background thread (C4:
+        # connecting can block for seconds) and enforces its OWN full
+        # sequence, including its own disclosure, internally.
+        if str(input.get("action") or "").strip() == "retarget":
+            return await asyncio.to_thread(self._computer.retarget, input.get("target"))
         # Same gate `computer` runs first (see `ComputerTool._ensure_announced`
         # and `ComputerTool.execute`'s own docstring) - `desktop` shares the
         # SAME `ComputerTool` instance, so this reuses (and, if this is the
@@ -2016,12 +2851,13 @@ class DesktopTool:
                     "message": f"unknown action {action!r}; expected one of {', '.join(DESKTOP_ACTIONS)}"
                 },
             )
-        if self._computer._read_only and action in _READ_ONLY_BLOCKED:
+        binding = self._computer._binding
+        if binding.read_only and action in _READ_ONLY_BLOCKED:
             return ToolResult(
                 success=False,
                 error={"message": f"action {action!r} blocked: mounted read_only"},
             )
-        backend = self._computer._backend
+        backend = binding.backend
         try:
             # C4, same reasoning as ComputerTool.execute: keep the sync Backend
             # protocol, move the (possibly-remote) blocking call off the event
@@ -2031,7 +2867,7 @@ class DesktopTool:
                 # is an explicit, named, always-audited gate distinct from
                 # `read_only` - see that attribute's docstring for the full
                 # rationale and default rules.
-                policy = self._computer._clipboard_read_policy
+                policy = binding.clipboard_read_policy
                 if policy == "block":
                     return ToolResult(
                         success=False,
@@ -2065,7 +2901,7 @@ class DesktopTool:
                 # target state but is dispatched here, not through `_run`,
                 # so it needs its own explicit wiring rather than inheriting
                 # `_guard_write` for free.
-                with self._computer._guard_write():
+                with self._computer._guard_write(binding=binding):
                     await asyncio.to_thread(backend.set_clipboard, body)
                 # §3 audit hardening: digest, never plaintext - the same
                 # discipline `type` uses, since clipboard content is exactly
@@ -2105,7 +2941,7 @@ class DesktopTool:
                     ),
                 )
             if (
-                self._computer._gate_writes
+                binding.gate_writes
                 and action in MUTATING_DESKTOP
                 and not self._computer._unattended_writes_ok
                 and not self._computer._interactive_write_approved
@@ -2146,7 +2982,9 @@ class DesktopTool:
                         )
                     },
                 )
-            summary, _ = await asyncio.to_thread(self._computer._run, action, input)
+            summary, _ = await asyncio.to_thread(
+                self._computer._run, action, input, binding=binding
+            )
             return ToolResult(success=True, output=summary)
         except (BackendError, ValueError) as exc:
             return ToolResult(
@@ -2407,9 +3245,22 @@ def _safety_state(computer: ComputerTool) -> dict[str, Any]:
     if guard is None:
         return {
             "guard": None,
+            # `guard: null` is structurally UNREACHABLE for the three
+            # backends this bundle ships today (Linux X11, macOS, Windows,
+            # and RemoteBackend forwarding to whichever of those the target
+            # runs) - `_build_coexistence_guard` builds one unconditionally
+            # whenever `presence_idle_ms()` exists AND resolves to a known
+            # `GUARD_MS` platform, which is true for all four. This is a
+            # forward-looking fail-safe for a hypothetical future backend
+            # with no proven presence-detector wiring, not a live alarm
+            # about the machine this report was just generated for - see
+            # `_build_coexistence_guard`'s own docstring for exactly which
+            # two conditions leave a backend with no guard.
             "note": (
                 "no coexistence guard for this backend - no halt protection "
-                "and no disclosure channel (docs/designs/coexistence.md \u00a75.5)"
+                "and no disclosure channel. See _build_coexistence_guard's "
+                "docstring for when this can happen (not reachable for any "
+                "backend this bundle ships today)."
             ),
         }
     out: dict[str, Any] = {
