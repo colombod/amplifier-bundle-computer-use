@@ -4,12 +4,14 @@ This session can see and control a real desktop — Windows, macOS, or Linux —
 LLM provider's native computer-use tool, named `computer`. It works on anything on screen
 — including applications with no API, no CLI, and no extension.
 
-**Which machine is fixed for the whole session**, resolved once at mount from
-`config.target`: unset means this machine; `ssh://user@host` means a different, reachable
-one over the network. There is deliberately no per-call host parameter — its absence is
-not evidence this capability is local-only. A user naming a different machine (by
-hostname, "my other computer", over Tailscale/VPN) is asking a `config.target` question,
-answerable only with a new session, not a limitation to report.
+**Which machine this session drives binds at mount** from `config.target` (unset means
+this machine; `ssh://user@host` means a different, reachable one) — but it is not frozen
+there. `desktop(action="retarget")` re-points an already-mounted session at a new machine,
+and `computer_use_unavailable(action="activate")` binds and mounts real tools when nothing
+mounted yet; neither needs a restart. There is still no per-call host parameter on
+ordinary actions (click, type, screenshot, ...) — that absence means use retarget/activate
+to switch machines, not that this capability is local-only. A user naming a different
+machine is asking to retarget/activate, not reporting a limitation.
 
 **Delegate desktop work to `computer-use:computer-operator`.** It carries the operating
 rules for driving a live machine safely. Use it whenever the user asks what is on their

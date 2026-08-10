@@ -31,15 +31,30 @@ logger = logging.getLogger(__name__)
 #: session). Deliberately a shape claim, not an existence claim: asserting
 #: "remote is possible" contradicts a schema that shows no host parameter, and
 #: a model reconciling prose against schema trusts the schema. Explaining WHY
-#: the schema is silent - the target is resolved once, at mount, not per call -
-#: is the fact that actually closes the gap.
+#: the schema is silent on the ORDINARY action calls (click, type,
+#: screenshot, ...) - the target binds at mount from config.target, and is
+#: re-bindable live via two dedicated actions rather than a per-call host
+#: argument - is the fact that actually closes the gap.
+#:
+#: Updated for M4 live re-target (65f97b7, `ComputerTool.retarget`,
+#: __init__.py:1533) and the unavailable-stub bootstrap (1b497ff,
+#: `ComputerUseUnavailableTool._activate`, __init__.py:4988): binding is no
+#: longer restart-only. Keep this fact in sync with those two call sites if
+#: either changes what it rebinds - this constant drifting stale here is
+#: exactly the failure mode `tests/test_target_model_claims.py` guards
+#: against.
 _TARGET_MODEL = (
     "set config.target='ssh://user@host' to point this capability at a "
-    "different, reachable machine instead. The target is bound ONCE, at "
-    "mount time - there is deliberately no per-call host parameter, and its "
-    "absence is not evidence this capability is local-only. Driving a "
-    "different machine means restarting with a new config.target, not a new "
-    "argument to an existing call."
+    "different, reachable machine. The target binds at mount time from "
+    "config.target - there is deliberately no per-call host parameter on "
+    "the ordinary actions (click, type, screenshot, ...), and its absence "
+    "is not evidence this capability is local-only. It IS re-bindable "
+    'live, mid-session, with no restart: desktop(action="retarget", '
+    "target=...) switches an already-mounted session to a new machine, "
+    'and computer_use_unavailable(action="activate", target=...) binds '
+    "and mounts real tools for a session where nothing mounted yet. "
+    "Driving a different machine means one of those two action calls - a "
+    "session restart is not required."
 )
 
 #: Appended to `NoBackendAvailable`'s message - the "what to do next" a bare
