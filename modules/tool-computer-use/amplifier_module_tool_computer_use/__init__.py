@@ -4321,6 +4321,491 @@ def _handle_remote_overlay_announce(
     return _RemoteAnnouncementHandle(backend.name)
 
 
+class _MountRefused(RuntimeError):
+    """Raised by `_select_and_build` for the ONE build-time failure that is
+    never a platform/reachability fact: `_refuse_if_disclosure_declined_with_human_present`
+    (mount-time counterpart of §7.6) refusing because a human is
+    already detected present and coexistence.announce/enabled was
+    EXPLICITLY declined in config. Kept as its own type (not folded into
+    `NoBackendAvailable`/`RemoteTargetUnavailable`) so callers can route it
+    to the LOUD branch of the silent/loud split below without re-deriving
+    that classification from a string message - see `mount()`'s own
+    docstring for the split itself.
+    """
+
+
+def _select_and_build(cfg: dict[str, Any]) -> ComputerTool:
+    """The blocking half of "get a working `ComputerTool` from a config":
+    select a backend (may block for seconds on a remote `connect()` -
+    C4), build the coexistence guard, and run the SAME mount-time
+    disclosure-declined-with-human-present check `mount()` has always run.
+
+    This is deliberately the ONE place this sequence is written - both
+    `mount()` (the normal, session-start path) and
+    `ComputerUseUnavailableTool._activate` (the "nothing was ever mounted,
+    an agent is now pointing this capability at a machine for the first
+    time" bootstrap path, see that method) call it, rather than each
+    re-implementing "connect, guard, disclose" a second/third time. It
+    mirrors (does not replace) the equivalent sequence `ComputerTool.retarget`
+    runs for an ALREADY-mounted tool (§6.2 steps 1-4) - retarget's own
+    machinery is reused as-is for every retarget AFTER this bootstrap; this
+    function only exists to get the FIRST `ComputerTool` into existence, a
+    case retarget cannot cover because it is an instance method with no
+    instance yet to call it on.
+
+    Raises `NoBackendAvailable`, `ValueError`/`TypeError` (malformed
+    `target`), `RemoteTargetUnavailable` (from `.remote_backend`, imported
+    lazily by `select_backend` itself), or `_MountRefused` - exactly the
+    set both callers already know how to translate into a diagnostic.
+    """
+    backend = select_backend(cfg)
+    computer = ComputerTool(backend, cfg)
+    # D2: resolve display once, here, before the tool ever answers a provider
+    # request - not lazily on the first `native_tool_spec` read.
+    computer.resolve_display()
+    # Human/agent coexistence (docs/designs/coexistence.md) - only built for
+    # backends with a proven presence-detector wiring (see
+    # `_build_coexistence_guard`). `None` on every other backend, unchanged
+    # from before this feature existed.
+    computer._coexistence_guard = _build_coexistence_guard(backend, cfg)
+    # Band lifetime (docs/designs/band-lifetime.md): the channel-scoped
+    # ledger and depth-counter this session's held-input tracking and
+    # band-lowering decisions use - `None` whenever no guard was built
+    # (same population as before this feature existed: no coexistence
+    # layer at all). Computed from the SAME backend `_build_coexistence_guard`
+    # was just given, so `_channel_identity` returns the identical key.
+    if computer._coexistence_guard is not None:
+        computer._channel_key = _channel_identity(backend)
+        computer._ledger = _get_channel_ledger(computer._channel_key)
+        computer._band_state = _get_channel_band_state(computer._channel_key)
+    # Defect fix (docs/designs/coexistence.md §7.6): `coexistence.announce`/
+    # `coexistence.enabled` declining disclosure used to surface only as an
+    # ordinary-looking `ToolResult(success=False)` on this session's first
+    # real action (`_ensure_announced` fires there, not here). Check here, at
+    # mount, with a single side-effect-free presence sample: refuse to mount
+    # outright when a human is already detected present with no disclosure
+    # channel, exactly as loud and exactly as early as `NoBackendAvailable`.
+    mount_coexistence_cfg = dict(cfg.get("coexistence") or {})
+    disclosure_refusal = _refuse_if_disclosure_declined_with_human_present(
+        mount_coexistence_cfg, computer._coexistence_guard, backend
+    )
+    if disclosure_refusal is not None:
+        try:
+            backend.close()
+        except Exception:  # noqa: BLE001 - best-effort cleanup on refusal
+            logger.debug(
+                "tool-computer-use: backend.close() failed after a "
+                "mount-time disclosure refusal",
+                exc_info=True,
+            )
+        raise _MountRefused(disclosure_refusal)
+    return computer
+
+
+async def _mount_backend(coordinator: Any, cfg: dict[str, Any]) -> dict[str, Any]:
+    """Build a working `computer`/`desktop` pair from `cfg` and mount both -
+    the successful-path body `mount()` used to inline directly. Extracted so
+    `ComputerUseUnavailableTool._activate` (the stub's new "point this at a
+    machine" operation - see that class) can reach the identical, already-
+    reviewed sequence instead of a parallel one. Raises exactly what
+    `_select_and_build` raises; callers translate that into a diagnostic
+    (`mount()`) or a `ToolResult` (`_activate`).
+    """
+    computer = await asyncio.to_thread(_select_and_build, cfg)
+    # Session-start disclosure (docs/designs/coexistence.md §7) is
+    # deliberately NOT built here - see `ComputerTool._ensure_announced` for
+    # why it fires on first real action instead (a validation-probe mount()
+    # must never be able to trigger a real dialog/overlay).
+    await coordinator.mount("tools", computer, name=computer.name)
+    desktop = DesktopTool(computer)
+    await coordinator.mount("tools", desktop, name=desktop.name)
+    backend_name = computer._backend.name
+    logger.info(
+        "tool-computer-use mounted: 'computer' (%s, backend=%s) + 'desktop'",
+        computer._tool_version,
+        backend_name,
+    )
+    return {
+        "name": "tool-computer-use",
+        "version": __version__,
+        "provides": ["computer", "desktop"],
+        "description": f"Anthropic native computer-use via backend={backend_name}",
+    }
+
+
+# ============================================================================
+# Discovery (`ComputerUseUnavailableTool` action="discover") - read-only,
+# side-effect-free survey of machines this agent could plausibly point
+# computer-use at. Every field below is exactly what its source reported -
+# never a guess papered over a gap. In particular: a Tailscale peer's
+# reported "owner" is the Tailscale ACCOUNT the node is registered to, NOT
+# necessarily a Unix login name on that machine - real-world example that
+# motivated this: a tailnet reporting owner "bkrabach@github" for a machine
+# whose actual working ssh user is "brkrabac". Treating that owner string as
+# an ssh user would silently produce a wrong, confidently-stated target.
+# Only `~/.ssh/config`'s explicit `User` directive for a Host is trusted as
+# an asserted ssh login user; everything else comes back with `user: null,
+# ambiguous_user: true` so the caller (agent or human) resolves it rather
+# than this function guessing.
+# ============================================================================
+
+
+def _parse_ssh_config(path: Path) -> dict[str, dict[str, str]]:
+    """Minimal `~/.ssh/config` reader: one dict per concrete (non-wildcard)
+    `Host` alias, with whatever of `HostName`/`User`/`Port` that block sets.
+    Deliberately not a full ssh_config parser (no `Match`/`Include`/multi-
+    pattern precedence) - this only ever feeds `discover`'s candidate list,
+    where "found a plausible lead" is the bar, not "authoritative ssh
+    resolution" (`ssh` itself remains the actual authority when a connection
+    is attempted).
+    """
+    if not path.is_file():
+        return {}
+    hosts: dict[str, dict[str, str]] = {}
+    current: list[str] = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        key, value = parts[0].lower(), parts[1].strip()
+        if key == "host":
+            current = [
+                alias
+                for alias in value.split()
+                if "*" not in alias and "?" not in alias
+            ]
+            for alias in current:
+                hosts.setdefault(alias, {})
+            continue
+        if key in ("hostname", "user", "port"):
+            for alias in current:
+                hosts[alias][key] = value
+    return hosts
+
+
+def _parse_known_hosts(path: Path) -> list[str]:
+    """Hostnames/IPs this machine has previously connected to. Hashed
+    entries (`|1|...`, the OpenSSH default since 6.6) carry no recoverable
+    hostname and are skipped rather than guessed at. No user information
+    exists in this file format at all - every candidate from this source is
+    `user: null, ambiguous_user: true`.
+    """
+    if not path.is_file():
+        return []
+    names: set[str] = set()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("|1|"):
+            continue
+        first_field = line.split(None, 1)[0]
+        for host in first_field.split(","):
+            host = host.strip()
+            if host.startswith("[") and "]" in host:
+                host = host[1 : host.index("]")]
+            if host:
+                names.add(host)
+    return sorted(names)
+
+
+def _tailscale_peers() -> tuple[list[dict[str, Any]], str | None]:
+    """`tailscale status --json` peers, or `([], reason)` if the binary is
+    missing, the daemon is unreachable, or output could not be parsed - a
+    tailnet is an optional source, never a hard requirement for `discover`.
+    """
+    import shutil
+    import subprocess
+
+    ts_path = shutil.which("tailscale")
+    if ts_path is None:
+        return [], "tailscale: not installed / not on PATH"
+    try:
+        proc = subprocess.run(
+            [ts_path, "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+            # Explicit, not the parent's fd 0 (a real terminal on a real
+            # desktop) - this is a one-shot, no-input helper call, exactly
+            # the discipline test_subprocess_stdin_safety.py enforces
+            # across this whole module.
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [], f"tailscale status --json failed to run: {exc}"
+    if proc.returncode != 0:
+        return [], (
+            f"tailscale status --json exited {proc.returncode}: "
+            f"{proc.stderr.strip() or proc.stdout.strip()}"
+        )
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return [], f"tailscale status --json returned invalid JSON: {exc}"
+    users = data.get("User") or {}
+    peers: list[dict[str, Any]] = []
+    for peer in (data.get("Peer") or {}).values():
+        user_id = str(peer.get("UserID") or "")
+        owner = (users.get(user_id) or {}).get("LoginName")
+        ips = peer.get("TailscaleIPs") or []
+        peers.append(
+            {
+                "hostname": peer.get("HostName") or None,
+                "dns_name": (peer.get("DNSName") or "").rstrip(".") or None,
+                "tailscale_ip": next((ip for ip in ips if "." in ip), None)
+                or (ips[0] if ips else None),
+                "tailscale_owner": owner,
+                "online": bool(peer.get("Online")),
+                "os": peer.get("OS") or None,
+            }
+        )
+    return peers, None
+
+
+def _discover_candidates() -> ToolResult:
+    """`action="discover"` - read-only, three sources, no network probing
+    beyond `tailscale status` (which talks to the LOCAL tailscaled, not the
+    candidate machines themselves - nothing here attempts to reach any
+    candidate). See the module-level comment above this section for the
+    ambiguous-user policy this implements.
+    """
+    candidates: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    for alias, fields in sorted(
+        _parse_ssh_config(Path.home() / ".ssh" / "config").items()
+    ):
+        candidates.append(
+            {
+                "source": "ssh_config",
+                "host_alias": alias,
+                "hostname": fields.get("hostname", alias),
+                "user": fields.get("user"),
+                "port": fields.get("port"),
+                "ambiguous_user": "user" not in fields,
+                "suggested_target": (
+                    f"ssh://{fields['user']}@{fields.get('hostname', alias)}"
+                    + (f":{fields['port']}" if fields.get("port") else "")
+                    if "user" in fields
+                    else None
+                ),
+            }
+        )
+
+    ts_peers, ts_warning = _tailscale_peers()
+    if ts_warning:
+        warnings.append(ts_warning)
+    for peer in ts_peers:
+        candidates.append(
+            {
+                "source": "tailscale",
+                "hostname": peer["hostname"] or peer["dns_name"],
+                "dns_name": peer["dns_name"],
+                "tailscale_ip": peer["tailscale_ip"],
+                "tailscale_owner": peer["tailscale_owner"],
+                "online": peer["online"],
+                "os": peer["os"],
+                "user": None,
+                "ambiguous_user": True,
+                "suggested_target": None,
+            }
+        )
+
+    for host in _parse_known_hosts(Path.home() / ".ssh" / "known_hosts"):
+        candidates.append(
+            {
+                "source": "known_hosts",
+                "hostname": host,
+                "user": None,
+                "ambiguous_user": True,
+                "suggested_target": None,
+            }
+        )
+
+    return ToolResult(
+        success=True,
+        output=json.dumps(
+            {
+                "candidates": candidates,
+                "warnings": warnings,
+                "guidance": (
+                    "Every candidate with ambiguous_user=true (user: null) has "
+                    "NO asserted ssh login user - do not guess one (a "
+                    "tailscale 'tailscale_owner' is the Tailscale ACCOUNT the "
+                    "node is registered to, not necessarily a Unix username on "
+                    "it, and the two commonly differ). Ask the human which "
+                    "user to connect as. Only ssh_config candidates with "
+                    "ambiguous_user=false carry a ready-to-use "
+                    "'suggested_target'. Once a target string is confirmed: "
+                    "if you want it to survive a restart, call action="
+                    '"persist" FIRST (order matters - a successful '
+                    '"activate" unmounts this very tool, so a later '
+                    '"persist" call against it would have nothing to call), '
+                    'then call action="activate" to make it live now.'
+                ),
+            },
+            default=str,
+        ),
+    )
+
+
+# ============================================================================
+# Persistence (`ComputerUseUnavailableTool` action="persist") - the ONLY
+# operation on this stub that writes the user's own settings.yaml, and it
+# writes ONLY when explicitly called with this action. A prior six-lens
+# council ruled 6/6 that an agent must never silently rewrite `config.target`
+# - "the answer to 'which machine am I about to control' ... the worst
+# mutation available in this bundle." That ruling is honored here in full:
+# discovery and activation never touch this file; this is the one, named,
+# explicit path that does, and it reports exactly what it wrote and how to
+# undo it. It exists at all because the user who owns that ruling has since
+# explicitly asked for exactly this capability, twice.
+# ============================================================================
+
+
+def _amplifier_home() -> Path:
+    """`~/.amplifier`, or `$AMPLIFIER_HOME` if set - the same two-line
+    resolution `amplifier_foundation.paths.resolution.get_amplifier_home()`
+    uses. Reimplemented locally (not imported) rather than adding a
+    dependency on the app-layer foundation package for two stdlib calls -
+    see IMPLEMENTATION_PHILOSOPHY.md's "Conventions via instructions, not
+    code": the pattern is documented, not shared, because this module
+    should not need to depend on `amplifier_foundation` at all.
+    """
+    env_home = os.environ.get("AMPLIFIER_HOME")
+    if env_home:
+        return Path(env_home).expanduser()
+    return Path.home() / ".amplifier"
+
+
+def _persist_target(
+    target: str | None, *, settings_path: Path | None = None
+) -> ToolResult:
+    """`action="persist"` - write (or update in place) ONE
+    `config.tools[]` entry: `{module: "tool-computer-use", config: {target:
+    <target>}}` - the exact shape the app CLI's settings merge already
+    expects (list of `{module, config}` dicts under `config.providers`/
+    `config.tools`/`config.hooks`, iterated by
+    `amplifier_app_cli/runtime/config.py`'s `resolve_bundle_config`). Every
+    other key in the file, and every other field already on this module's
+    own entry, is preserved untouched - only `config.target` inside THIS
+    entry is written. `settings_path` is a test seam (default: `_amplifier_home()
+    / "settings.yaml"`, the real file a user edits by hand today).
+    """
+    import yaml
+
+    path = settings_path or (_amplifier_home() / "settings.yaml")
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            return ToolResult(
+                success=False,
+                error={
+                    "message": (
+                        f"refusing to write: {path} is not valid YAML "
+                        f"({exc}) - fix or remove it by hand first"
+                    ),
+                    "type": "InvalidSettingsFile",
+                },
+            )
+        if loaded is not None and not isinstance(loaded, dict):
+            return ToolResult(
+                success=False,
+                error={
+                    "message": (
+                        f"refusing to write: {path} does not contain a "
+                        "YAML mapping at the top level"
+                    ),
+                    "type": "InvalidSettingsFile",
+                },
+            )
+        existing = loaded or {}
+
+    config_section = existing.setdefault("config", {})
+    if not isinstance(config_section, dict):
+        return ToolResult(
+            success=False,
+            error={
+                "message": f"refusing to write: {path}'s 'config' key is not a mapping",
+                "type": "InvalidSettingsFile",
+            },
+        )
+    tools_section = config_section.setdefault("tools", [])
+    if not isinstance(tools_section, list):
+        return ToolResult(
+            success=False,
+            error={
+                "message": f"refusing to write: {path}'s 'config.tools' key is not a list",
+                "type": "InvalidSettingsFile",
+            },
+        )
+
+    entry = next(
+        (
+            item
+            for item in tools_section
+            if isinstance(item, dict) and item.get("module") == "tool-computer-use"
+        ),
+        None,
+    )
+    if entry is None:
+        entry = {"module": "tool-computer-use", "config": {}}
+        tools_section.append(entry)
+    entry_cfg = entry.setdefault("config", {})
+    if not isinstance(entry_cfg, dict):
+        return ToolResult(
+            success=False,
+            error={
+                "message": (
+                    "refusing to write: the existing tool-computer-use "
+                    "entry's 'config' is not a mapping"
+                ),
+                "type": "InvalidSettingsFile",
+            },
+        )
+
+    normalized = str(target).strip() if target else ""
+    if normalized and normalized != "local":
+        entry_cfg["target"] = normalized
+        action_desc = f"set config.tools[].config.target={normalized!r}"
+    else:
+        entry_cfg.pop("target", None)
+        action_desc = "removed config.tools[].config.target (persisted as local)"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(existing, sort_keys=False), encoding="utf-8")
+
+    return ToolResult(
+        success=True,
+        output=json.dumps(
+            {
+                "wrote": str(path),
+                "change": action_desc,
+                "undo": (
+                    f"edit {path}: remove the 'target' key from the "
+                    "config.tools[] entry whose module is 'tool-computer-use' "
+                    "(or delete that whole list entry), then restart the "
+                    "session - nothing else in the file was touched"
+                ),
+            },
+            default=str,
+        ),
+    )
+
+
 class ComputerUseUnavailableTool:
     """Registered in place of `computer`/`desktop` whenever `mount()` could not
     obtain a working backend (see `_mount_unavailable`).
@@ -4335,14 +4820,29 @@ class ComputerUseUnavailableTool:
     was ever supposed to exist, silently improvised its own `ssh`+`screencapture`
     workaround instead of telling the user computer-use was unavailable.
 
+    Self-configuring fix: the tombstone above closed HALF the defect - the
+    model could finally SEE it was unavailable, but had no way to DO anything
+    about it, so a technical user still had to hand-edit settings.yaml (and,
+    for real, get the shape wrong - the old message named the config KEY but
+    never the FILE, the nesting, or that `config.tools[]` mirrors
+    `config.providers[]`). Three new `action`s close the other half, entirely
+    through calls this tool itself exposes - no config file ever has to be
+    hand-edited for an agent to go from "nothing mounted" to "driving a
+    machine": `discover` (read-only survey of candidate machines - see
+    `_discover_candidates`), `activate` (build a real, disclosed
+    `ComputerTool`/`DesktopTool` pair and mount them for real - see
+    `_activate`, which reuses `_mount_backend`/`_select_and_build`, the exact
+    machinery `mount()` itself uses, rather than a parallel path), and
+    `persist` (the ONE explicit, named write to the user's settings.yaml -
+    see `_persist_target` for why it is never a side effect of the other two).
+
     This tool is NOT a degraded form of `computer`/`desktop` - it never
-    attempts to serve a single real action, so it does not weaken D1's "do not
-    pretend to work" invariant. It exists purely to make the refusal visible in
-    the one place a silently-omitted tool cannot be: the tool declarations
-    sent with *every* provider request, whether or not the model ever calls
-    it. Its `execute()` is a fallback for the (unlikely, since its own
-    description says not to) case the model calls it anyway - still an honest,
-    immediate failure, never a hang or a fabricated result.
+    attempts to serve a single real screen/mouse/keyboard action, so it does
+    not weaken D1's "do not pretend to work" invariant. Its `execute()` for
+    any action OTHER than the three above is a fallback for the (unlikely,
+    since its own description says not to) case the model calls it expecting
+    `computer`/`desktop` semantics anyway - still an honest, immediate
+    failure, never a hang or a fabricated result.
 
     Deliberately a distinct name (`computer_use_unavailable`), not `computer`/
     `desktop`: those names are reserved for a tool that can actually act
@@ -4351,8 +4851,20 @@ class ComputerUseUnavailableTool:
     model's own tool list, and defeats the whole point of a distinct signal.
     """
 
-    def __init__(self, reason: str) -> None:
+    def __init__(
+        self,
+        reason: str,
+        coordinator: Any = None,
+        cfg: dict[str, Any] | None = None,
+    ) -> None:
         self._reason = reason
+        # Both default to None/{} - existing callers (and tests) that
+        # construct this with just a reason string keep working unchanged;
+        # `discover`/`persist` need neither, only `activate` needs
+        # `_coordinator` (to actually mount the real tools) and uses `_cfg`
+        # as the base config to layer a `target` onto (see `_activate`).
+        self._coordinator = coordinator
+        self._cfg: dict[str, Any] = dict(cfg or {})
 
     @property
     def name(self) -> str:
@@ -4363,18 +4875,143 @@ class ComputerUseUnavailableTool:
         return (
             "computer-use ('computer'/'desktop': screen capture, mouse, keyboard, "
             "window control) is NOT available this session and those tools were "
-            f"NOT mounted. Reason: {self._reason} This placeholder tool always "
-            "fails - it exists only so this is visible to you instead of silently "
-            "absent. Do not attempt to see or control a screen this session; tell "
-            "the user computer-use is unavailable and why, rather than improvising "
-            "a workaround (e.g. driving a remote machine over a shell tool)."
+            f"NOT mounted. Reason: {self._reason} Do not attempt to see or "
+            "control a screen this session via any other tool (e.g. improvising "
+            "a workaround over a shell tool) - tell the user computer-use is "
+            "unavailable and why, UNLESS you can resolve it yourself with the "
+            "actions below. This tool can point computer-use at a machine "
+            'without anyone hand-editing config: action="discover" surveys '
+            "candidate machines (Tailscale, ~/.ssh/config, ~/.ssh/known_hosts) "
+            "read-only; action=\"activate\" (target='ssh://user@host[:port]' or "
+            "omitted/'local') builds and mounts real `computer`/`desktop` tools "
+            "for this session right now, replacing this stub on success; "
+            'action="persist" (same target argument) writes that choice to '
+            "the user's settings.yaml so it survives a restart - this is the "
+            "ONLY action that writes anything, and it always reports exactly "
+            "what it wrote and how to undo it. Any OTHER action on this tool "
+            "always fails - it never simulates a real screen/mouse/keyboard "
+            "action."
         )
 
     @property
     def input_schema(self) -> dict[str, Any]:
-        return {"type": "object", "properties": {}}
+        return {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["discover", "activate", "persist"],
+                    "description": (
+                        "discover: read-only candidate-machine survey. "
+                        "activate: build+mount real computer/desktop tools "
+                        "for this session now. persist: write the target to "
+                        "settings.yaml so it survives a restart."
+                    ),
+                },
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "'ssh://user@host[:port]' for activate/persist, or "
+                        "omitted/'local' for this machine's own local backend."
+                    ),
+                },
+            },
+            "required": ["action"],
+        }
+
+    async def _activate(self, target: str | None) -> ToolResult:
+        """`action="activate"` - the bootstrap entry point requirement 1
+        needs: from a session where NOTHING mounted, build a real, disclosed
+        `ComputerTool`/`DesktopTool` pair and mount them, so the real tools
+        become callable in THIS running session with no restart. Reuses
+        `_mount_backend`/`_select_and_build` - the exact sequence `mount()`
+        itself runs - rather than a parallel implementation (see this
+        class's own docstring). On success, unmounts this stub (`self`) so
+        the model never sees a contradictory "unavailable" tool sitting next
+        to a working one. On failure, this stub simply stays mounted and
+        reports why, exactly like every other honest failure in this module -
+        never a silent no-op, never a fabricated success.
+        """
+        if self._coordinator is None:
+            return ToolResult(
+                success=False,
+                error={
+                    "message": (
+                        "no coordinator bound to this stub instance - it was "
+                        "constructed directly (e.g. in a test) rather than "
+                        "via mount(), so activate has nothing to mount into"
+                    ),
+                    "type": "ComputerUseUnavailable",
+                },
+            )
+        new_cfg = dict(self._cfg)
+        normalized = str(target).strip() if target else ""
+        if normalized and normalized != "local":
+            new_cfg["target"] = normalized
+        else:
+            new_cfg.pop("target", None)
+
+        try:
+            manifest = await _mount_backend(self._coordinator, new_cfg)
+        except NoBackendAvailable as exc:
+            return ToolResult(
+                success=False,
+                error={"message": str(exc), "type": "NoBackendAvailable"},
+            )
+        except (ValueError, TypeError) as exc:
+            return ToolResult(
+                success=False,
+                error={
+                    "message": f"invalid configuration: {exc}",
+                    "type": type(exc).__name__,
+                },
+            )
+        except _MountRefused as exc:
+            return ToolResult(
+                success=False,
+                error={"message": str(exc), "type": "MountRefused"},
+            )
+        except Exception as exc:  # noqa: BLE001 - see mount()'s identical guard
+            from .remote_backend import RemoteTargetUnavailable
+
+            if not isinstance(exc, RemoteTargetUnavailable):
+                raise
+            return ToolResult(
+                success=False,
+                error={"message": str(exc), "type": "RemoteTargetUnavailable"},
+            )
+
+        try:
+            await self._coordinator.unmount("tools", name=self.name)
+        except Exception:  # noqa: BLE001 - best-effort; the real tools are
+            # already live either way, this only tidies up the now-redundant
+            # stub entry.
+            logger.debug(
+                "tool-computer-use: failed to unmount the unavailable-stub "
+                "after a successful activate",
+                exc_info=True,
+            )
+        self._cfg = new_cfg
+        logger.info(
+            "tool-computer-use: activated from the unavailable-stub - %s",
+            manifest.get("description"),
+        )
+        return ToolResult(
+            success=True,
+            output=json.dumps(
+                {**manifest, "activated_target": new_cfg.get("target", "local")},
+                default=str,
+            ),
+        )
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
+        action = str(input.get("action") or "").strip()
+        if action == "discover":
+            return await asyncio.to_thread(_discover_candidates)
+        if action == "activate":
+            return await self._activate(input.get("target"))
+        if action == "persist":
+            return await asyncio.to_thread(_persist_target, input.get("target"))
         del input
         return ToolResult(
             success=False,
@@ -4382,19 +5019,59 @@ class ComputerUseUnavailableTool:
         )
 
 
-async def _mount_unavailable(coordinator: Any, reason: str) -> dict[str, Any]:
+# ============================================================================
+# Silent-vs-loud split (self-configuring / silent-when-inapplicable):
+#
+# `_mount_unavailable`'s ONE caller-visible knob is `loud`. The two classes
+# it distinguishes:
+#
+#   STATE, not a defeated ask (`loud=False`, logged at DEBUG only): no
+#   `target` was configured AND no local backend is possible on this
+#   platform (`NoBackendAvailable` - `select_backend` only ever raises this
+#   in the no-`target` path, see registry.py). Nobody asked this session to
+#   drive a screen; a broad bundle simply happened to include this module.
+#   There is nothing to warn about - the stub still mounts (the MODEL always
+#   learns the capability is off, via that tool's own description, on every
+#   request - fail-loud to the one audience that can act on it) but the
+#   HUMAN'S console stays clean, because their request was never refused.
+#
+#   INTENT DEFEATED (`loud=True`, logged at ERROR, unchanged from before this
+#   fix): a `target` WAS configured and is unreachable (`RemoteTargetUnavailable`),
+#   config is malformed (`ValueError`/`TypeError`), or coexistence disclosure
+#   was explicitly declined while a human is present (`_MountRefused`).
+#   Someone configured something and did not get it - that is always worth a
+#   human's attention, exactly as it was before this fix.
+#
+# This is NOT "no fallbacks" erosion: a real failure (any INTENT DEFEATED
+# case above) is exactly as loud as it always was. Only the case where
+# nothing was ever asked for and nothing was denied - a platform fact, not a
+# failure - stops paging a human who never made a request in the first
+# place. Next reader: if you add a new exception branch here, ask "did this
+# session ask for something and not get it?" - if yes, `loud=True`; if the
+# honest answer is "nothing was asked for", `loud=False`.
+# ============================================================================
+
+
+async def _mount_unavailable(
+    coordinator: Any, reason: str, cfg: dict[str, Any], *, loud: bool = True
+) -> dict[str, Any]:
     """Shared "not mounted" path for every branch of `mount()` that cannot
     obtain a working backend - see `ComputerUseUnavailableTool` for why a
-    stub tool, not just a log line, is what actually closes Defect 2.
-
-    ERROR, not WARNING (this bundle's previous level for the D1/no-local-
-    backend case): this bundle is only ever mounted because an operator opted
-    into computer-use, so failing to deliver it is always worth their
-    attention, whether the cause is an expected platform gap or an
-    unreachable remote target.
+    stub tool, not just a log line, is what actually closes Defect 2, and
+    the comment block directly above this function for what `loud` means
+    and why it exists.
     """
-    logger.error("tool-computer-use: NOT MOUNTING computer/desktop - %s", reason)
-    stub = ComputerUseUnavailableTool(reason)
+    if loud:
+        logger.error("tool-computer-use: NOT MOUNTING computer/desktop - %s", reason)
+    else:
+        logger.debug(
+            "tool-computer-use: not mounting computer/desktop this session "
+            "(no target configured and no local backend on this platform - "
+            "a state, not a failed request; the model still sees this via "
+            "the mounted stub's own description) - %s",
+            reason,
+        )
+    stub = ComputerUseUnavailableTool(reason, coordinator, cfg)
     await coordinator.mount("tools", stub, name=stub.name)
     return {
         "name": "tool-computer-use",
@@ -4411,17 +5088,22 @@ async def mount(
 
     D1 fix: this used to construct `WindowsBridge` and mount both tools
     unconditionally - on any platform. Now every configured backend is probed
-    first (`registry.select_backend`); if none can serve this machine, `computer`/
-    `desktop` are not mounted at all - this function still returns normally (it
-    does not raise - a missing backend is not a bundle-load failure) - but see
-    `_mount_unavailable`/`ComputerUseUnavailableTool`: D1's refusal to mount a
-    non-functional backend is unchanged, only what happens instead of silence.
+    first (`registry.select_backend`, via `_select_and_build`); if none can
+    serve this machine, `computer`/`desktop` are not mounted at all - this
+    function still returns normally (it does not raise - a missing backend is
+    not a bundle-load failure) - but see `_mount_unavailable`/
+    `ComputerUseUnavailableTool`: D1's refusal to mount a non-functional
+    backend is unchanged, only what happens instead of silence, and (as of
+    the self-configuring fix) whether that "instead" is loud - see the
+    comment block above `_mount_unavailable` for the silent/loud split.
     """
     cfg = config or {}
     try:
-        backend = select_backend(cfg)
+        return await _mount_backend(coordinator, cfg)
     except NoBackendAvailable as exc:
-        return await _mount_unavailable(coordinator, str(exc))
+        # No `target` configured and no local backend on this platform - a
+        # state, not a defeated ask. See the silent/loud comment block above.
+        return await _mount_unavailable(coordinator, str(exc), cfg, loud=False)
     except (ValueError, TypeError) as exc:
         # A malformed config (e.g. `target: user@host` instead of
         # `target: ssh://user@host`) raises out of `select_backend`, NOT as
@@ -4430,7 +5112,11 @@ async def mount(
         # log line, nothing in the session to explain the absence. Observed for
         # real: a session was asked to drive a remote desktop, found no tool, and
         # silently improvised its own ssh+screencapture workaround instead.
-        return await _mount_unavailable(coordinator, f"invalid configuration: {exc}")
+        return await _mount_unavailable(
+            coordinator, f"invalid configuration: {exc}", cfg, loud=True
+        )
+    except _MountRefused as exc:
+        return await _mount_unavailable(coordinator, str(exc), cfg, loud=True)
     except Exception as exc:
         # Defect 2 fix: `select_backend`'s remote branch raises
         # `RemoteTargetUnavailable` (`.remote_backend`) for an explicitly
@@ -4459,84 +5145,4 @@ async def mount(
 
         if not isinstance(exc, RemoteTargetUnavailable):
             raise
-        return await _mount_unavailable(coordinator, str(exc))
-
-    computer = ComputerTool(backend, cfg)
-    # D2: resolve display once, here, before the tool ever answers a provider
-    # request - not lazily on the first `native_tool_spec` read.
-    computer.resolve_display()
-    # Human/agent coexistence (docs/designs/coexistence.md) - only built for
-    # backends with a proven presence-detector wiring (see
-    # `_build_coexistence_guard`). `None` on every other backend, unchanged
-    # from before this feature existed.
-    computer._coexistence_guard = _build_coexistence_guard(backend, cfg)
-    # Band lifetime (docs/designs/band-lifetime.md): the channel-scoped
-    # ledger and depth-counter this session's held-input tracking and
-    # band-lowering decisions use - `None` whenever no guard was built
-    # (same population as before this feature existed: no coexistence
-    # layer at all). Computed from the SAME backend `_build_coexistence_guard`
-    # was just given, so `_channel_identity` returns the identical key.
-    if computer._coexistence_guard is not None:
-        computer._channel_key = _channel_identity(backend)
-        computer._ledger = _get_channel_ledger(computer._channel_key)
-        computer._band_state = _get_channel_band_state(computer._channel_key)
-    # Defect fix (docs/designs/coexistence.md §7.6): `coexistence.announce`/
-    # `coexistence.enabled` declining disclosure used to surface only as an
-    # ordinary-looking `ToolResult(success=False)` on this session's first
-    # real action (`_ensure_announced` fires there, not here - see the big
-    # comment a few lines down for why). Check here, at mount, with a single
-    # side-effect-free presence sample: refuse to mount outright when a
-    # human is already detected present with no disclosure channel, exactly
-    # as loud and exactly as early as `NoBackendAvailable` already is below.
-    mount_coexistence_cfg = dict(cfg.get("coexistence") or {})
-    disclosure_refusal = _refuse_if_disclosure_declined_with_human_present(
-        mount_coexistence_cfg, computer._coexistence_guard, backend
-    )
-    if disclosure_refusal is not None:
-        try:
-            backend.close()
-        except Exception:  # noqa: BLE001 - best-effort cleanup on refusal
-            logger.debug(
-                "tool-computer-use: backend.close() failed after a "
-                "mount-time disclosure refusal",
-                exc_info=True,
-            )
-        return await _mount_unavailable(coordinator, disclosure_refusal)
-    # Session-start disclosure (docs/designs/coexistence.md §7) - the
-    # Linux/Windows overlay or the macOS announce-and-acknowledge dialog,
-    # whichever this backend supports - is deliberately NOT built here.
-    #
-    # It used to be: `mount()` called `_build_announcement()` directly, right
-    # after the coexistence guard, and could refuse to mount via
-    # `AnnouncementRefused`. That broke the moment a REAL session started:
-    # `amplifier_core`'s loader calls every tool module's `mount()` TWICE -
-    # once as a throwaway protocol-compliance probe
-    # (`amplifier_core.validation.tool.ToolValidator._check_protocol_compliance`,
-    # against a `MockCoordinator` whose result is discarded and torn down a
-    # few lines later) and once for real. Both calls ran this module's real
-    # `mount()` with the real config, so the probe showed a real dialog to a
-    # real human for a `ComputerTool`/`CoexistenceGuard` pair that was about
-    # to be thrown away - and any consent given applied to that discarded
-    # pair, not the one actually about to drive anything.
-    #
-    # The disclosure now fires on THIS session's first real action instead -
-    # see `ComputerTool._ensure_announced`, called at the top of both
-    # `ComputerTool.execute()` and `DesktopTool.execute()`. A validation
-    # probe never calls `execute()`, only `mount()`, so it cannot trigger
-    # this at all. `mount()` therefore always proceeds to mount both tools
-    # below; refusal (and the same backend.close() safety net that used to
-    # live here) happens later, at first use.
-    await coordinator.mount("tools", computer, name=computer.name)
-    desktop = DesktopTool(computer)
-    await coordinator.mount("tools", desktop, name=desktop.name)
-    logger.info(
-        "tool-computer-use mounted: 'computer' (%s, backend=%s) + 'desktop'",
-        computer._tool_version,
-        backend.name,
-    )
-    return {
-        "name": "tool-computer-use",
-        "version": __version__,
-        "provides": ["computer", "desktop"],
-        "description": f"Anthropic native computer-use via backend={backend.name}",
-    }
+        return await _mount_unavailable(coordinator, str(exc), cfg, loud=True)
