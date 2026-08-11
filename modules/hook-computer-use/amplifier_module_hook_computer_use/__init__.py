@@ -715,6 +715,32 @@ def _note_model_on_computer_tool(coordinator: Any, model: str | None) -> None:
 
 def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
     if getattr(provider, _WRAPPED_FLAG, False):
+        # Already wrapped for complete()-wrapping purposes, but priming must
+        # still run on EVERY turn this provider is about to handle, not only
+        # its first. `handler()` calls `_wrap_provider` unconditionally on
+        # every `PROVIDER_REQUEST` - the same event this function's wrap-time
+        # priming below relies on to run "before the orchestrator's first
+        # native_tool_spec read." Bailing out here with no priming assumed
+        # only ONE provider instance would ever share this session's mounted
+        # `computer` tool. A routing matrix breaks that assumption: distinct
+        # provider instances (e.g. an Opus `reasoning` provider and a Haiku
+        # `fast`-role provider) can share ONE coordinator and therefore ONE
+        # `computer` tool. Each provider's OWN wrap/complete cycle primes and
+        # corrects that SHARED tool for ITS OWN model - so a later turn
+        # routed to a DIFFERENT provider leaves the tool holding THAT
+        # provider's tool_version. When the routing matrix comes back to
+        # THIS (already-wrapped) provider, its own `complete()` wrapper
+        # would eventually re-correct it, but not until AFTER this turn's
+        # `native_tool_spec` has already been read and sent - one turn too
+        # late, and the exact wire error this closes: a request built with
+        # another provider's tool_version. Re-priming here, every time this
+        # hook fires for this provider, keeps the shared tool correct for
+        # THIS turn's read regardless of which other provider ran in
+        # between. Safe to call unconditionally - see `note_model`'s and
+        # `_note_model_on_computer_tool`'s own docstrings.
+        _note_model_on_computer_tool(
+            coordinator, getattr(provider, "default_model", None)
+        )
         return False
     tool_type = _resolve_native_tool_type(coordinator)
     if not _provider_supports_native_computer_tool(provider, tool_type):

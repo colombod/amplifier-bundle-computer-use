@@ -300,6 +300,53 @@ def test_wrapped_complete_prefers_an_explicit_request_model_override_over_defaul
     assert computer._tool_version == "computer_20250124"
 
 
+def test_wrap_provider_re_primes_tool_version_on_every_turn_even_when_already_wrapped():
+    """Multi-provider routing-matrix defect (the user's exact wire error).
+
+    A session's routing matrix can route different turns to DIFFERENT
+    provider instances (e.g. `claude-opus-5` for `reasoning`, a Haiku
+    sub-agent for `fast` utility work) that all share ONE coordinator and
+    therefore ONE mounted `computer` tool. `_wrap_provider` only primes
+    `_tool_version` the FIRST time it wraps a GIVEN provider instance
+    (gated by `_WRAPPED_FLAG`); once opus is wrapped and has run a turn, a
+    LATER wrap of a *different* provider instance (Haiku) re-primes the
+    SAME shared tool for Haiku's model. When the routing matrix comes back
+    to opus for its next turn, `_wrap_provider(opus_provider, ...)` is
+    called again (PROVIDER_REQUEST fires every turn) but early-returns
+    immediately (already wrapped) WITHOUT re-priming - so the orchestrator's
+    `native_tool_spec` read for opus's next turn still sees Haiku's stale
+    `computer_20250124`, one full turn before opus's own wrapped
+    `complete()` ever runs to correct it back. That stale read is what goes
+    out on the wire and gets rejected: "claude-opus-5 does not support tool
+    types: computer_20250124".
+    """
+    computer = _with_resolved_display(
+        ComputerTool(_FakeBackend(), {"model": "claude-opus-5"})
+    )
+    coord = _FakeCoordinator({"computer": computer})
+
+    opus_provider = _AnthropicProviderNoStream(default_model="claude-opus-5")
+    assert hook_mod._wrap_provider(opus_provider, coord, max_inline=3) is True
+    assert computer._tool_version == "computer_20251124"  # opus turn 1: correct
+
+    # A DIFFERENT provider instance (a Haiku sub-agent under the same
+    # session's routing matrix) wraps for its own first turn - the SAME
+    # shared `computer` tool, primed from Haiku's default_model.
+    haiku_provider = _AnthropicProviderNoStream(
+        default_model="claude-haiku-4-5-20251001"
+    )
+    assert hook_mod._wrap_provider(haiku_provider, coord, max_inline=3) is True
+    assert computer._tool_version == "computer_20250124"  # now wrong for opus
+
+    # The routing matrix comes back to opus for its NEXT turn:
+    # PROVIDER_REQUEST fires for opus again (already wrapped), and
+    # native_tool_spec is read BEFORE opus's own complete() runs. This must
+    # already be correct - not one turn late.
+    hook_mod._wrap_provider(opus_provider, coord, max_inline=3)
+    assert computer._tool_version == "computer_20251124"
+    assert computer.native_tool_spec["type"] == "computer_20251124"
+
+
 def test_wrapped_complete_tolerates_a_coordinator_that_cannot_find_the_tool():
     """No `computer` tool mounted (e.g. lookup races mount order, or this
     session never mounted computer-use at all) - must degrade to a no-op,
