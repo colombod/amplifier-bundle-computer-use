@@ -646,15 +646,55 @@ accepted, every placement input is re-read and compared against the snapshot the
 built from: the active ID list and its order, each display's backing scale, and each
 display's full bounds. A display that moves or resizes mid-composite invalidates it.
 
+**Native first, everywhere. All of the above is the exception path.**
+
+`CGDisplayCreateImage` answers a per-display or region capture, and
+`CGWindowListCreateImage` answers a whole-virtual-desktop capture, whenever they are
+healthy. On a macOS where they are, none of the `screencapture` machinery above ever runs
+and it costs nothing. This is deliberate and it is why there is no OS-version check
+anywhere in this backend:
+
+| | macOS 26.6.2 (25G83) | macOS 26.7 (25G229) |
+|---|---|---|
+| `CGDisplayCreateImage` | ~5.0s → **NULL** | 0.02–0.08s → real image |
+| `CGWindowListCreateImage` | **30.04s** → a correct image | 0.07s → a correct image |
+
+Same machine, measured either side of one OS update. A version table would have encoded
+those two observations as a rule, and been wrong about 26.0–26.5 (never measured) and about
+whatever Apple does next.
+
+**What makes native-first safe when native is broken** is that a call which behaved
+pathologically once is never attempted again in that process. Note the two signatures
+differ, and only one looks like a failure: `CGDisplayCreateImage` returns `NULL`, while
+`CGWindowListCreateImage` returns *exactly the right image*, just far too late to use — 30s
+is also the SSH transport's per-op timeout, so over the wire it does not return a slow
+image, it drops the connection. Only the **duration** catches the second one. A native call
+cannot be cancelled once started; it can be refused a second time, and that is the whole
+mechanism.
+
+A session whose very first capture is a whole-desktop capture has nothing learned yet. It
+settles the question with `CGDisplayCreateImage` (~5s worst case) rather than
+`CGWindowListCreateImage` (~30s), so **nothing ever pays 30 seconds to discover that
+something costs 30 seconds**. That inference — a healthy per-display call means a healthy
+whole-desktop call — is the one soft spot: they are different calls and could in principle
+diverge, in which case the first whole-desktop capture pays once and the session never pays
+again.
+
+The degraded fact lives on the backend instance and is **never persisted**. The remote agent
+is one process per session, so an OS update takes effect on the next session with no cache
+to invalidate — which is not a hypothetical: the update in the table above landed mid-review
+of this change.
+
 **Failure policy.** A guard that refuses — permission, session, topology, budget, or a
 cleanup failure — is reported to the caller. It is never answered by trying a different
-capture: doing so would return a legacy image taken after an explicit refusal, or report
-success while a private capture file remained on disk. The **only** condition that falls
-back to `CGWindowListCreateImage` is "this platform cannot composite" (for example a pyobjc
-without the bitmap-context symbols), which is decided entirely before any child process
-runs or any file exists. Before that legacy call the session state is re-read, because it is
-itself ~30s on macOS 26 — long enough for a screen to lock inside one capture, and a locked
-screen returns a real, plausible-looking image.
+capture: doing so would return an image taken after an explicit refusal, or report success
+while a private capture file remained on disk. The **only** condition that falls back from
+the compositor is "this platform cannot composite" (for example a pyobjc without the
+bitmap-context symbols), which is decided entirely before any child process runs or any file
+exists. The session state is re-read before compositing, because reaching that point means a
+native call already ran and a degraded one can burn 30s on its own — long enough for a
+screen to lock inside a single capture, after which a locked screen returns a real,
+plausible-looking image.
 
 This is a conservative fallback, not a permission prompt or reset. A positive preflight does
 not establish that the utility has the same TCC attribution, and none of these checks can

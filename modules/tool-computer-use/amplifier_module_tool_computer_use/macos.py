@@ -542,6 +542,17 @@ def _char_to_keycode_and_flags(ch: str) -> tuple[int, int] | None:
     return None
 
 
+#: A native CoreGraphics capture call that takes at least this long has not
+#: "been slow", it has been PATHOLOGICAL, and it will be again. Measured on one
+#: machine across an OS update: on macOS 26.6.2 `CGDisplayCreateImage` blocked
+#: ~5.0s and then returned NULL, and `CGWindowListCreateImage` took a flat 30.0s
+#: to return a CORRECT image; on 26.7 the same calls took 0.02-0.08s and 0.07s.
+#: Any value between those populations works - this sits in the middle of a gap
+#: three orders of magnitude wide, which is why it is a threshold and not a
+#: guess about a version number.
+_NATIVE_CAPTURE_SLOW_SECONDS = 2.0
+
+
 class _Unset:
     """Sentinel type: distinguishes "no observed preflight supplied" from a real
     `None` preflight result, which is itself one of the three diagnoses."""
@@ -560,6 +571,13 @@ class MacOSBackend:
         self._osascript_timeout = float(cfg.get("timeout", 15.0))
         self._input_trusted_checked = False
         self._input_blocked_reason: str | None = None
+        #: Has a native CoreGraphics capture call already proven itself
+        #: pathological in THIS process? See `_call_native`. Per instance and
+        #: never persisted: the remote agent is one process per session, so an
+        #: OS update takes effect on the next session with no cache to
+        #: invalidate. That is not incidental - this flag exists because an OS
+        #: update silently changed the answer underneath a running branch.
+        self._native_capture_degraded = False
 
     # -- capability probe (D1) ---------------------------------------------------
     def probe(self) -> ProbeResult:
@@ -1160,6 +1178,77 @@ class MacOSBackend:
                         "cleanup failed: private capture data may remain"
                     ) from None
 
+    def _call_native(self, fn: Any, *args: Any) -> Any:
+        """Make a native capture call, and learn from how it behaved.
+
+        The platform's own call stays PRIMARY everywhere; everything this module
+        adds is the exception path. That is deliberate, and it is what keeps a
+        healthy macOS paying nothing for code it does not need - on 26.7 the
+        native calls answer in 0.02-0.08s and neither the `screencapture`
+        fallback nor the compositor ever runs.
+
+        What makes native-first safe on a macOS where it is NOT healthy is this
+        function. There are two distinct degradation signatures, and only one of
+        them looks like a failure:
+
+            CGDisplayCreateImage     ~5.0s  -> NULL            (macOS 26.6.2)
+            CGWindowListCreateImage  30.04s -> a CORRECT image (macOS 26.6.2)
+
+        The second returns exactly what was asked for, just far too late to be
+        usable - 30s is also `SshTransport.send()`'s per-op timeout, so over the
+        remote transport it does not return a slow image, it drops the
+        connection. Only the DURATION catches that one.
+
+        A native call cannot be cancelled once started. It can, however, be
+        refused a second time: a call that was pathological once is recorded as
+        degraded, and no later capture in this process attempts it again. That
+        single fact replaces any version comparison. It is observed rather than
+        predicted, so it self-corrects in both directions - if a future macOS
+        regresses these calls again, nothing here needs to know the version
+        number.
+        """
+        started = time.monotonic()
+        image = fn(*args)
+        elapsed = time.monotonic() - started
+        if image is None or elapsed >= _NATIVE_CAPTURE_SLOW_SECONDS:
+            if not self._native_capture_degraded:
+                logger.info(
+                    "macos: native capture degraded on this system (%s in %.2fs, "
+                    "image=%s); using the screencapture path for the rest of this "
+                    "session",
+                    getattr(fn, "__name__", fn),
+                    elapsed,
+                    image is not None,
+                )
+            self._native_capture_degraded = True
+        return image
+
+    def _learn_native_capture_health(self, ids: list[int]) -> None:
+        """Settle the degraded question using the CHEAP call, never the expensive one.
+
+        A session whose very first capture is a whole-virtual-desktop capture has
+        nothing to go on yet. Asking `CGWindowListCreateImage` directly would cost
+        30s on a degraded system to discover that it costs 30s - and that is
+        precisely the op-timeout drop being avoided. `CGDisplayCreateImage` answers
+        the same question about the same capture stack for ~5s worst case, so the
+        cheap call is the one that gets to be wrong.
+
+        Inference, stated plainly: a healthy `CGDisplayCreateImage` is taken as
+        evidence that `CGWindowListCreateImage` is healthy too. They are different
+        calls and could in principle diverge; if they do, `_call_native` observes
+        it on the first whole-desktop capture and the session never pays twice.
+        """
+        if self._native_capture_degraded or not ids:
+            return
+        try:
+            self._call_native(Quartz.CGDisplayCreateImage, ids[0])
+        except Exception:  # noqa: BLE001 - a probe that cannot run teaches nothing
+            # Deliberately NOT treated as degraded. This is a question we failed
+            # to ask, not an answer: leaving the flag alone keeps native-first,
+            # and `_call_native` still records the real outcome when the actual
+            # capture runs.
+            return
+
     def _screencapture_virtual_desktop(self, ids: list[int], deadline: float) -> Any:
         """Composite one guarded per-display capture into the virtual desktop image.
 
@@ -1329,15 +1418,20 @@ class MacOSBackend:
         in the same unit.
 
         Whole-virtual-desktop path (`region=None` with more than one active display,
-        i.e. `monitors.VIRTUAL_DESKTOP` mode): composites the per-display guarded
-        captures into one canvas - the point-space bounding box of every active display
-        at the LARGEST backing scale among them, which reproduces exactly what
-        `CGWindowListCreateImage(CGRectInfinite, ...)` produces, including its
-        approximation for genuinely mixed-DPI setups (a 1x display is upscaled to the
-        2x canvas). That call remains the fallback when compositing is unavailable, but
-        is no longer the primary: it costs a flat 30.0s on macOS 26, which is also the
-        remote transport's per-op timeout. Verified on a mixed-DPI pair: same
-        13696x2880 output, 0.47s against 30.04s.
+        i.e. `monitors.VIRTUAL_DESKTOP` mode): `CGWindowListCreateImage` answers it
+        whenever it is healthy - 0.07s on macOS 26.7. Only when it is not does this
+        composite the per-display guarded captures into one canvas: the point-space
+        bounding box of every active display at the LARGEST backing scale among them,
+        which reproduces what that call itself produces, including its approximation
+        for genuinely mixed-DPI setups (a 1x display is upscaled to the 2x canvas).
+        Verified against it on a mixed-DPI pair: same 13696x2880 output, 0.47s against
+        that call's 30.04s on macOS 26.6.2, where it was pathological.
+
+        NATIVE FIRST, both here and on the per-display path below - see
+        `_call_native`. Nothing in this backend compares OS versions; a native call
+        that behaves pathologically once is recorded and not attempted again in this
+        process, which is observed rather than predicted and so survives Apple fixing
+        or re-breaking these calls.
 
         Checked BEFORE any Quartz capture call, every time (never cached): a locked
         screen produces a real, plausible-looking `CGDisplayCreateImage` result, not
@@ -1376,30 +1470,46 @@ class MacOSBackend:
             raise BackendError("no active displays; cannot capture the screen")
 
         if region is None and len(ids) > 1:
-            # A guard refusal inside the compositor propagates out of this call -
-            # it is never answered by trying a different capture. `None` means only
-            # "this platform cannot composite", which is the one case the legacy
-            # path may answer.
-            cg_image = self._screencapture_virtual_desktop(ids, fallback_deadline)
-            if cg_image is None:
-                # Re-read the session before the legacy call. The state check at the
-                # top of this method can be arbitrarily stale by now, and
-                # CGWindowListCreateImage is itself ~30s on macOS 26 - long enough
-                # for a screen to lock inside one capture. A locked screen returns a
-                # real, plausible-looking image, so nothing downstream would notice.
-                state, detail = _macos_session_state()
-                if state != "unlocked":
-                    raise BackendError(
-                        _session_state_error(state, detail, "capture a screenshot")
-                    )
-                cg_image = Quartz.CGWindowListCreateImage(
+            # NATIVE FIRST, exactly as the per-display path below already does.
+            # `CGWindowListCreateImage` is the platform's own answer here and on a
+            # healthy macOS it is the fast one (0.07s on 26.7); the compositor is
+            # the exception path, not the default. Symmetry with the per-display
+            # branch is what removes any need to gate on an OS version.
+            cg_image = None
+            self._learn_native_capture_health(ids)
+            if not self._native_capture_degraded:
+                cg_image = self._call_native(
+                    Quartz.CGWindowListCreateImage,
                     Quartz.CGRectInfinite,
                     Quartz.kCGWindowListOptionOnScreenOnly,
                     Quartz.kCGNullWindowID,
                     Quartz.kCGWindowImageDefault,
                 )
+                if cg_image is not None and self._native_capture_degraded:
+                    # It answered, but pathologically slowly - so it is recorded
+                    # degraded and will not be attempted again this session. The
+                    # image itself is real; use it rather than waste the wait.
+                    return self._encode_png(cg_image)
             if cg_image is None:
-                raise BackendError("CGWindowListCreateImage returned no image")
+                # Re-read the session before compositing. The check at the top of
+                # this method can be arbitrarily stale by now: a degraded native
+                # call can burn 30s on its own, long enough for a screen to lock
+                # inside one capture, and a locked screen returns a real,
+                # plausible-looking image that nothing downstream would question.
+                state, detail = _macos_session_state()
+                if state != "unlocked":
+                    raise BackendError(
+                        _session_state_error(state, detail, "capture a screenshot")
+                    )
+                # A guard refusal inside the compositor propagates out of this
+                # call - it is never answered by trying a different capture.
+                # `None` means only "this platform cannot composite".
+                cg_image = self._screencapture_virtual_desktop(ids, fallback_deadline)
+            if cg_image is None:
+                raise BackendError(
+                    "neither CGWindowListCreateImage nor the screencapture "
+                    "compositor produced a virtual-desktop image"
+                )
             return self._encode_png(cg_image)
 
         display_id = ids[0] if region is None else None
@@ -1414,7 +1524,14 @@ class MacOSBackend:
             m = next(mi for mi in self._monitor_infos() if int(mi.id) == display_id)
             w, h = m.width, m.height
 
-        full_image = Quartz.CGDisplayCreateImage(display_id)
+        # Same rule as the branch above: native first, unless this process has
+        # already watched it fail. Skipping it once degraded is what removes the
+        # ~5s-per-screenshot cost on a macOS where it returns NULL the slow way.
+        full_image = (
+            None
+            if self._native_capture_degraded
+            else self._call_native(Quartz.CGDisplayCreateImage, display_id)
+        )
         if full_image is None:
             if len(ids) == 1 and display_id == ids[0] and int(m.id) == ids[0]:
                 full_image = self._screencapture_single_display(m, fallback_deadline)

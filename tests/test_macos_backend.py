@@ -1905,39 +1905,31 @@ def test_compositor_unavailable_still_falls_back_to_legacy(monkeypatch):
     assert MacOSBackend({}).capture() == b"legacy"
 
 
-def test_legacy_fallback_rechecks_the_session_before_capturing(monkeypatch):
-    """capture() used to call the legacy API with no fresh session read. That call
-    is ~30s on macOS 26 - long enough for a screen to lock inside one capture, and
-    a locked screen returns a real, plausible-looking image."""
-    fake = _FakeQuartz(
-        [
-            {"id": 7, "bounds": (0, 0, 2, 1), "pixel_w": 2, "pixel_h": 1, "main": True},
-            {
-                "id": 9,
-                "bounds": (2, 0, 2, 1),
-                "pixel_w": 2,
-                "pixel_h": 1,
-                "main": False,
-            },
-        ]
-    )
-    fake.CGWindowListCreateImage = lambda *_a: pytest.fail(
-        "legacy capture ran on a locked session"
-    )
-    fake.CGRectInfinite = "infinite"
-    fake.kCGWindowListOptionOnScreenOnly = 1
-    fake.kCGNullWindowID = 0
-    fake.kCGWindowImageDefault = 0
-    monkeypatch.setattr(macos, "Quartz", fake)
-    states = iter([("unlocked", "test")])
+def test_session_is_rechecked_before_compositing(compositing_backend, monkeypatch):
+    """The whole-desktop path re-reads the session before reaching the compositor.
+
+    Native-first means the platform call happens immediately after the entry
+    check, so it needs no second read. The compositor does: getting there means a
+    native call already ran, and a degraded one can burn 30s on its own - long
+    enough for a screen to lock inside a single capture, after which a locked
+    screen returns a real, plausible-looking image.
+    """
+    backend, fake, _seen = compositing_backend
+    fake.CGWindowListCreateImage = lambda *_a: None  # force the compositing path
+    states = iter([("unlocked", "entry"), ("locked", "CGSSessionScreenIsLocked=True")])
     monkeypatch.setattr(
         macos,
         "_macos_session_state",
         lambda: next(states, ("locked", "CGSSessionScreenIsLocked=True")),
     )
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *_a, **_k: pytest.fail("a child ran on a locked session"),
+    )
 
     with pytest.raises(BackendError, match="LOCKED"):
-        MacOSBackend({}).capture()
+        backend.capture()
 
 
 # -- blocker 2: the whole layout must still match when the composite is accepted
@@ -2078,3 +2070,132 @@ def test_compositor_runs_for_real_in_the_multi_display_branch(compositing_backen
     assert len(fake.drawn) == 2, "both displays must be drawn into the canvas"
     assert fake.legacy_calls == 0, "the legacy path must not run when compositing works"
     assert len(seen["argv"]) == 2, "one child process per display"
+
+
+# -- native-first, and learning when native cannot be trusted ------------------
+#
+# The platform's own call stays primary everywhere; this module's screencapture
+# work is the exception path. What makes that safe on a macOS where the native
+# calls are broken is that a call which behaved pathologically once is never
+# attempted again in the same process. Two signatures, only one of which looks
+# like a failure:
+#     CGDisplayCreateImage     ~5.0s  -> NULL            (macOS 26.6.2)
+#     CGWindowListCreateImage  30.04s -> a CORRECT image (macOS 26.6.2)
+
+
+def test_healthy_native_answers_whole_desktop_and_compositor_never_runs(
+    compositing_backend,
+):
+    """On a healthy macOS (26.7 measured 0.07s) the compositor is dead weight."""
+    backend, fake, seen = compositing_backend
+    # The shared fake models macOS 26.6.2, where the native call returns NULL.
+    # Healthy means both native calls answer.
+    fake.CGDisplayCreateImage = lambda display_id: _FallbackImage(4, 2)
+    fake.CGWindowListCreateImage = lambda *_a: _FallbackImage(12, 2)
+
+    assert backend.capture() == b"composite"  # _encode_png is stubbed
+    assert fake.drawn == [], "no compositing should have happened"
+    assert seen["argv"] == [], "no screencapture child should have run"
+    assert backend._native_capture_degraded is False
+
+
+def test_native_returning_none_marks_degraded_and_is_not_retried(
+    compositing_backend, monkeypatch
+):
+    backend, fake, _seen = compositing_backend
+    calls = {"n": 0}
+
+    def counting_native(_display_id):
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(fake, "CGDisplayCreateImage", counting_native)
+    fake.CGWindowListCreateImage = lambda *_a: pytest.fail(
+        "the expensive call must not run once native is known degraded"
+    )
+
+    assert backend.capture() == b"composite"
+    assert backend._native_capture_degraded is True
+
+    # Second capture in the same process: the dead call is not asked again. This
+    # is what removes the ~5s-per-screenshot cost on a degraded macOS.
+    before = calls["n"]
+    assert backend.capture() == b"composite"
+    assert calls["n"] == before, "a call already proven dead was attempted again"
+
+
+def test_native_that_is_correct_but_pathologically_slow_marks_degraded(
+    compositing_backend, monkeypatch
+):
+    """The 30s-but-correct signature - only the DURATION catches this one.
+
+    The clock is simulated rather than slept, so the test costs nothing.
+    """
+    backend, fake, _seen = compositing_backend
+    fake.CGDisplayCreateImage = lambda display_id: _FallbackImage(4, 2)
+    fake.CGWindowListCreateImage = lambda *_a: _FallbackImage(12, 2)
+    #  #1 capture() deadline | #2,#3 cheap probe (fast) | #4,#5 legacy (31s)
+    clock = iter([0.0, 0.0, 0.1, 1.0, 32.0])
+    monkeypatch.setattr(macos.time, "monotonic", lambda: next(clock, 32.0))
+
+    # It answered, so the image is used rather than the wait wasted...
+    assert backend.capture() == b"composite"
+    # ...but it is never trusted again.
+    assert backend._native_capture_degraded is True
+
+
+def test_unknown_health_probes_with_the_cheap_call_not_the_expensive_one(
+    compositing_backend, monkeypatch
+):
+    """Nothing may pay 30s to discover that something costs 30s.
+
+    A session whose FIRST capture is whole-desktop has nothing learned yet. The
+    question gets settled by CGDisplayCreateImage (~5s worst case), and only then
+    is the expensive call considered.
+    """
+    backend, fake, _seen = compositing_backend
+    order: list[str] = []
+
+    def cheap(_display_id):
+        order.append("cheap")
+        return None  # degraded: the expensive call must now be skipped entirely
+
+    def expensive(*_args):
+        order.append("expensive")
+        return _FallbackImage(12, 2)
+
+    monkeypatch.setattr(fake, "CGDisplayCreateImage", cheap)
+    monkeypatch.setattr(fake, "CGWindowListCreateImage", expensive)
+
+    assert backend.capture() == b"composite"
+    assert order == ["cheap"], f"expected only the cheap probe, got {order}"
+
+
+def test_a_probe_that_cannot_run_does_not_mark_degraded(
+    compositing_backend, monkeypatch
+):
+    """A question we failed to ask is not an answer.
+
+    If the probe itself raises (a Quartz without that symbol), the flag is left
+    alone so native-first still applies; the real capture records the real
+    outcome.
+    """
+    backend, fake, _seen = compositing_backend
+
+    def missing(_display_id):
+        raise AttributeError("CGDisplayCreateImage unavailable")
+
+    monkeypatch.setattr(fake, "CGDisplayCreateImage", missing)
+    fake.CGWindowListCreateImage = lambda *_a: _FallbackImage(12, 2)
+
+    assert backend.capture() == b"composite"
+    assert backend._native_capture_degraded is False
+
+
+def test_degraded_state_is_per_instance_and_never_persisted(compositing_backend):
+    """A fresh backend re-learns, which is how an OS update takes effect next
+    session with no cache to invalidate - the exact failure that prompted this."""
+    backend, fake, _seen = compositing_backend
+    backend._native_capture_degraded = True
+
+    assert MacOSBackend({})._native_capture_degraded is False
