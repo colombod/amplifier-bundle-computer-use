@@ -1276,10 +1276,30 @@ def test_capture_initial_non_unlocked_state_never_starts_fallback(monkeypatch, s
         backend.capture()
 
 
-@pytest.mark.parametrize("preflight", [False, None])
+@pytest.mark.parametrize(
+    ("preflight", "expected", "not_expected"),
+    [
+        (
+            False,
+            "Screen Recording permission is NOT granted",
+            "could not determine Screen Recording",
+        ),
+        (
+            None,
+            "could not determine Screen Recording permission status",
+            "is NOT granted",
+        ),
+    ],
+)
 def test_capture_fallback_refuses_nonpositive_preflight_without_child(
-    monkeypatch, preflight
+    monkeypatch, preflight, expected, not_expected
 ):
+    """Fail closed, but say WHICH non-positive result and what to do about it.
+
+    A denied grant and an unavailable preflight symbol need different actions
+    from the operator. Both used to collapse into "preflight was not positive",
+    which sent them to the same dead end.
+    """
     backend, _fake = _fallback_backend(monkeypatch)
     monkeypatch.setattr(macos, "_cg_preflight_screen_capture_access", lambda: preflight)
     monkeypatch.setattr(
@@ -1288,8 +1308,62 @@ def test_capture_fallback_refuses_nonpositive_preflight_without_child(
         lambda *_args, **_kwargs: pytest.fail("child process started"),
     )
 
-    with pytest.raises(BackendError, match="preflight was not positive"):
+    with pytest.raises(BackendError) as excinfo:
         backend.capture()
+
+    message = str(excinfo.value)
+    assert "preflight was not positive" in message
+    assert expected in message
+    assert not_expected not in message, "the two diagnoses must stay distinguishable"
+    if preflight is False:
+        # The actionable half: where to go and what else can cause it.
+        assert "System Settings -> Privacy & Security -> Screen Recording" in message
+
+
+def test_capture_fallback_refusal_reports_the_preflight_it_decided_on(monkeypatch):
+    """The message must format the OBSERVED value, not take a second read.
+
+    A second read can disagree with the one the refusal was actually based on,
+    and then the error describes a state that never governed anything. Here the
+    preflight flips False -> None between reads; the message must describe the
+    False that caused the refusal.
+    """
+    backend, _fake = _fallback_backend(monkeypatch)
+    results = iter([False, None])
+    monkeypatch.setattr(
+        macos, "_cg_preflight_screen_capture_access", lambda: next(results, None)
+    )
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("child process started"),
+    )
+
+    with pytest.raises(BackendError) as excinfo:
+        backend.capture()
+
+    assert "Screen Recording permission is NOT granted" in str(excinfo.value)
+
+
+def test_capture_none_error_accepts_an_already_observed_preflight(monkeypatch):
+    """`_capture_none_error` keeps its original self-reading behaviour when the
+    caller supplies nothing, and skips the read entirely when it does."""
+    backend, _fake = _fallback_backend(monkeypatch)
+    reads = []
+
+    def _counting():
+        reads.append(1)
+        return True
+
+    monkeypatch.setattr(macos, "_cg_preflight_screen_capture_access", _counting)
+
+    supplied = backend._capture_none_error(7, granted=False)
+    assert reads == [], "a supplied value must not trigger a preflight read"
+    assert "is NOT granted" in supplied
+
+    self_read = backend._capture_none_error(7)
+    assert reads == [1]
+    assert "even though Screen Recording permission is granted" in self_read
 
 
 def test_capture_fallback_refuses_locked_recheck_without_child(monkeypatch):

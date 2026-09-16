@@ -643,9 +643,21 @@ Multi-display/virtual-desktop capture and region capture while multiple displays
 remain outside this fallback's scope. Existing diagnostics are unchanged and this does not
 claim to diagnose or fix a physical display condition.
 
-Offline logic tests cover this adaptation; it has not been verified on real macOS hardware.
-The capture-alternative lead was reported by [@colombod in PR #11](https://github.com/microsoft/amplifier-bundle-computer-use/pull/11);
-this narrower adaptation is not a claim of independent hardware verification.
+Offline logic tests cover this adaptation, and it **has** now been verified on real macOS
+hardware: [exact-head report on PR #13](https://github.com/microsoft/amplifier-bundle-computer-use/pull/13#issuecomment-5688667363).
+That run drove **macOS 26.6.2 (25G83)** with a **single active 5120x1440 display**, over the
+SSH production path (`registry.select_backend({"target": "ssh://..."}) -> RemoteBackend
+.connect() -> capture_scaled()`), and exercised **both full-screen and region capture**; no
+guard refused spuriously across four consecutive runs. On that machine the native
+`CGDisplayCreateImage` returned `None` in ~5.0s and `screencapture` completed in ~0.23s.
+
+What that run does **not** establish, stated so it is not inferred: nothing about multiple
+active displays (out of scope here - see PR #11), three or more displays, non-top-aligned
+arrangements, or whether `-m` still follows the main display when main is not the first
+active display. A positive preflight still does not establish that the utility has the same
+TCC attribution, and the topology and permission checks remain non-atomic regardless of this
+result. The capture-alternative lead was reported by
+[@colombod in PR #11](https://github.com/microsoft/amplifier-bundle-computer-use/pull/11).
 
 ---
 

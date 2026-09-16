@@ -28,11 +28,20 @@ line declared in `modules/tool-computer-use/pyproject.toml` and
 
 ### Fixed
 
-- Added a narrow, offline-logic-tested-only macOS fallback after native per-display capture
-  returns `None`: one bounded `screencapture -m` attempt for an unchanged single active main
-  display, with fresh preflight, lock/topology checks, private temporary storage, and
-  in-memory PNG decoding. Real-macOS verification is still required. Adapted from the
-  capture-alternative lead reported by [@colombod in PR #11](https://github.com/microsoft/amplifier-bundle-computer-use/pull/11).
+- Added a narrow macOS fallback after native per-display capture returns `None`: one bounded
+  `screencapture -m` attempt for an unchanged single active main display, with fresh
+  preflight, lock/topology checks, private temporary storage, and in-memory PNG decoding.
+  Verified on real hardware - macOS 26.6.2, one active 5120x1440 display, over the SSH
+  production path, full-screen and region capture
+  ([report](https://github.com/microsoft/amplifier-bundle-computer-use/pull/13#issuecomment-5688667363)).
+  Multiple active displays are out of scope here (see PR #11), as are three or more displays
+  and non-top-aligned arrangements; the topology and permission checks are non-atomic and the
+  20-second budget is elapsed-time accounting, not a hard wall-clock guarantee. Adapted from
+  the capture-alternative lead reported by [@colombod in PR #11](https://github.com/microsoft/amplifier-bundle-computer-use/pull/11).
+- A refused fallback now names WHICH non-positive preflight result it saw - a denied Screen
+  Recording grant and an unavailable preflight symbol need different actions from the
+  operator, and both previously collapsed into "preflight was not positive". The diagnosis
+  formats the value the refusal was decided on rather than taking a second read.
 - Two silent failures blocking end-to-end remote desktop control.
 - Missing `python-xlib` now reported as a missing dependency rather than surfacing as
   an X server connection failure.

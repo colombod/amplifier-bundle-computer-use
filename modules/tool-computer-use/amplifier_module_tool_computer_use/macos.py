@@ -542,6 +542,14 @@ def _char_to_keycode_and_flags(ch: str) -> tuple[int, int] | None:
     return None
 
 
+class _Unset:
+    """Sentinel type: distinguishes "no observed preflight supplied" from a real
+    `None` preflight result, which is itself one of the three diagnoses."""
+
+
+_UNSET = _Unset()
+
+
 class MacOSBackend:
     """Executes computer-use actions against the local macOS desktop, in-process."""
 
@@ -829,7 +837,55 @@ class MacOSBackend:
             )
         return monitors
 
-    def _capture_none_error(self, display_id: int | None) -> str:
+    @staticmethod
+    def _screen_recording_cause(granted: bool | None) -> str:
+        """The cause-and-remediation clause for an OBSERVED preflight result.
+
+        Split out of `_capture_none_error` so the same three diagnoses can be
+        reused by any caller that has already read the preflight - notably the
+        `screencapture` fallback's own refusal, which previously collapsed
+        `False` and `None` into one generic "was not positive" message and
+        threw away the remediation this text carries.
+
+        Takes the observed value as an argument rather than reading it:
+        a second read can disagree with the one the decision was actually
+        made on, and then the message describes a state that never governed
+        anything.
+        """
+        if granted is False:
+            return (
+                "Screen Recording permission is NOT granted to this "
+                "process (CGPreflightScreenCaptureAccess() == False). macOS "
+                "raises no exception for this - it just hands back nothing. "
+                "Two known causes: (1) the grant was never made - open "
+                "System Settings -> Privacy & Security -> Screen Recording "
+                "and enable the process actually running this code; (2) "
+                f"{_CONCURRENT_AGENT_CAUSE}."
+            )
+        if granted is True:
+            # Permission genuinely is granted - a permissions guess would be
+            # wrong here, so this is the one branch that mentions sleep.
+            return (
+                "Screen Recording permission is granted "
+                "(CGPreflightScreenCaptureAccess() == True) - the display "
+                "itself is the likely cause: it may have gone to sleep or "
+                "been disconnected."
+            )
+        # Could not check (older macOS/pyobjc without the preflight symbol) -
+        # name every known cause honestly rather than asserting one as fact.
+        return (
+            "this process could not determine Screen Recording "
+            "permission status to narrow down why "
+            "(CGPreflightScreenCaptureAccess unavailable on this system). "
+            "Known causes, in likely order: a revoked or never-granted "
+            "Screen Recording permission (macOS raises no exception for "
+            f"this); {_CONCURRENT_AGENT_CAUSE}; or the display having gone "
+            "to sleep or been disconnected."
+        )
+
+    def _capture_none_error(
+        self, display_id: int | None, granted: bool | None | _Unset = _UNSET
+    ) -> str:
         """Compose the error for `CGDisplayCreateImage` returning `None`.
 
         This used to be a single guessed message ("display may have gone to
@@ -843,39 +899,21 @@ class MacOSBackend:
         (`_cg_preflight_screen_capture_access`), so this asks rather than
         guesses, and only reaches for "the display is asleep" once the
         permission itself is confirmed granted.
+
+        `granted` may be supplied by a caller that has ALREADY observed the
+        preflight, so the message describes the value the decision was made
+        on rather than a second, possibly different read. Omitted, it reads
+        the preflight itself - the original behaviour, unchanged.
         """
-        granted = _cg_preflight_screen_capture_access()
+        if isinstance(granted, _Unset):
+            granted = _cg_preflight_screen_capture_access()
         base = f"CGDisplayCreateImage({display_id}) returned no image"
+        cause = self._screen_recording_cause(granted)
         if granted is False:
-            return (
-                f"{base}: Screen Recording permission is NOT granted to this "
-                "process (CGPreflightScreenCaptureAccess() == False). macOS "
-                "raises no exception for this - it just hands back nothing. "
-                "Two known causes: (1) the grant was never made - open "
-                "System Settings -> Privacy & Security -> Screen Recording "
-                "and enable the process actually running this code; (2) "
-                f"{_CONCURRENT_AGENT_CAUSE}."
-            )
+            return f"{base}: {cause}"
         if granted is True:
-            # Permission genuinely is granted - a permissions guess would be
-            # wrong here, so this is the one branch that mentions sleep.
-            return (
-                f"{base} even though Screen Recording permission is granted "
-                "(CGPreflightScreenCaptureAccess() == True) - the display "
-                "itself is the likely cause: it may have gone to sleep or "
-                "been disconnected."
-            )
-        # Could not check (older macOS/pyobjc without the preflight symbol) -
-        # name every known cause honestly rather than asserting one as fact.
-        return (
-            f"{base}, and this process could not determine Screen Recording "
-            "permission status to narrow down why "
-            "(CGPreflightScreenCaptureAccess unavailable on this system). "
-            "Known causes, in likely order: a revoked or never-granted "
-            "Screen Recording permission (macOS raises no exception for "
-            f"this); {_CONCURRENT_AGENT_CAUSE}; or the display having gone "
-            "to sleep or been disconnected."
-        )
+            return f"{base} even though {cause}"
+        return f"{base}, and {cause}"
 
     @staticmethod
     def _single_display_fallback_error(reason: str) -> BackendError:
@@ -928,9 +966,17 @@ class MacOSBackend:
         initially singular target. `-m` selects the freshly verified main display; no
         secondary-display ordinal mapping or multi-display composition is attempted.
         """
-        if _cg_preflight_screen_capture_access() is not True:
+        preflight = _cg_preflight_screen_capture_access()
+        if preflight is not True:
+            # Fail closed, as before - but say WHICH non-positive result this
+            # was and what to do about it. A denied grant and an unavailable
+            # preflight symbol need different actions from the operator, and
+            # the generic "was not positive" wording sent both to the same
+            # dead end. Formats the value observed immediately above; never a
+            # second read.
             raise self._single_display_fallback_error(
-                "refused: fresh screen-capture preflight was not positive"
+                "refused: fresh screen-capture preflight was not positive - "
+                + self._screen_recording_cause(preflight)
             )
 
         temp_dir: str | None = None
