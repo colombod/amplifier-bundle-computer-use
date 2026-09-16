@@ -622,25 +622,49 @@ problems with different fixes:
 
 ---
 
-### Narrow macOS single-display capture fallback
+### macOS capture fallback: per-display, and a multi-display compositor
 
 If native `CGDisplayCreateImage` returns `None`, capture may make one bounded
-`/usr/sbin/screencapture -m` attempt **only** when exactly one active display remains the
-main display with unchanged physical geometry. Before launching it, the backend requires a
-fresh positive Screen Recording preflight and an unlocked session; it rechecks the unlocked
-state and display identity after the child, decodes the private temporary PNG into memory,
-and rejects unexpected dimensions. The temporary directory and file are private; cleanup
-is attempted on every path. A cleanup failure is reported explicitly because private
-capture data may remain.
+`/usr/sbin/screencapture` attempt **per display**. When exactly one display is active it
+uses `-m` and requires that display to remain the sole main display with unchanged physical
+geometry. With several displays active it uses `-D <1-based ordinal>` into the active
+display list, and requires that display to still be present with unchanged geometry and the
+list itself not reordered — the ordinal is an index into that list, so a reorder would
+silently retarget the capture.
+
+Both forms take the same guards: a fresh positive Screen Recording preflight and an unlocked
+session before the child, the unlocked state and display identity rechecked after it, the
+private temporary PNG decoded into memory, and unexpected dimensions rejected. The temporary
+directory and file are private; cleanup is attempted on every path, and a cleanup failure is
+reported explicitly because private capture data may remain.
+
+Whole-virtual-desktop capture with several displays active composites those per-display
+captures into one canvas — the point-space bounding box of every active display at the
+**largest** backing scale among them, which is the geometry
+`CGWindowListCreateImage(CGRectInfinite, ...)` itself produces. Before the composite is
+accepted, every placement input is re-read and compared against the snapshot the canvas was
+built from: the active ID list and its order, each display's backing scale, and each
+display's full bounds. A display that moves or resizes mid-composite invalidates it.
+
+**Failure policy.** A guard that refuses — permission, session, topology, budget, or a
+cleanup failure — is reported to the caller. It is never answered by trying a different
+capture: doing so would return a legacy image taken after an explicit refusal, or report
+success while a private capture file remained on disk. The **only** condition that falls
+back to `CGWindowListCreateImage` is "this platform cannot composite" (for example a pyobjc
+without the bitmap-context symbols), which is decided entirely before any child process
+runs or any file exists. Before that legacy call the session state is re-read, because it is
+itself ~30s on macOS 26 — long enough for a screen to lock inside one capture, and a locked
+screen returns a real, plausible-looking image.
 
 This is a conservative fallback, not a permission prompt or reset. A positive preflight does
-not establish that the utility has the same TCC attribution, and the checks cannot make
-topology or permission use atomic. The 20-second fallback budget includes prior capture and
-setup work; the child receives only time remaining. It leaves a usual 10-second margin below
-the default 30-second wire timeout for encoding, but does not guarantee a hard wall time.
-Multi-display/virtual-desktop capture and region capture while multiple displays are active
-remain outside this fallback's scope. Existing diagnostics are unchanged and this does not
-claim to diagnose or fix a physical display condition.
+not establish that the utility has the same TCC attribution, and none of these checks can
+make topology or permission use atomic — the final whole-layout revalidation is a best-effort
+consistency check, not atomic topology access, and the layout can move again immediately
+after it passes. The 20-second fallback budget includes prior capture and setup work; the
+child receives only time remaining. It leaves a usual 10-second margin below the default
+30-second wire timeout for encoding, but does not guarantee a hard wall time. Existing
+diagnostics are unchanged and this does not claim to diagnose or fix a physical display
+condition.
 
 Offline logic tests cover this adaptation, and it **has** now been verified on real macOS
 hardware: [exact-head report on PR #13](https://github.com/microsoft/amplifier-bundle-computer-use/pull/13#issuecomment-5688667363).
@@ -649,6 +673,16 @@ SSH production path (`registry.select_backend({"target": "ssh://..."}) -> Remote
 .connect() -> capture_scaled()`), and exercised **both full-screen and region capture**; no
 guard refused spuriously across four consecutive runs. On that machine the native
 `CGDisplayCreateImage` returned `None` in ~5.0s and `screencapture` completed in ~0.23s.
+
+The multi-display paths were verified on the same machine with a second display attached, a
+genuinely mixed-DPI pair — a 2x built-in (1728x1117 points at the origin) beside the 1x
+5120x1440 ultrawide. Whole-desktop capture returned the same 13696x2880 canvas as
+`CGWindowListCreateImage` in 0.47s against its 30.04s, and region capture — which fails
+outright on macOS 26 without the per-display form — returned an exact 800x600 crop.
+
+**Not** covered by any of those runs, stated so it is not inferred: three or more displays,
+non-top-aligned display arrangements, and whether `-m` still follows the main display when
+main is not the first active display (in the verified arrangement it was).
 
 What that run does **not** establish, stated so it is not inferred: nothing about multiple
 active displays (out of scope here - see PR #11), three or more displays, non-top-aligned

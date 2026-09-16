@@ -1191,6 +1191,10 @@ class MacOSBackend:
         Returns `None` (never raises) if any display cannot be captured, so the caller
         falls back to the original call rather than shipping a partial canvas.
         """
+        # PHASE 1 - setup only. Nothing here starts a child process, touches disk,
+        # or consults a guard, so a failure means "this platform cannot composite"
+        # (e.g. a pyobjc without the bitmap-context symbols) and falling back is
+        # correct. This is the ONLY phase whose failures are swallowed.
         try:
             scales = {d: self._display_scale(d) for d in ids}
             bounds = {d: Quartz.CGDisplayBounds(d) for d in ids}
@@ -1220,32 +1224,98 @@ class MacOSBackend:
             )
             if context is None:
                 return None
-
-            for ordinal, display_id in enumerate(ids, start=1):
-                image = self._screencapture_display(
-                    monitors[display_id], deadline, ordinal, ids
-                )
-                if image is None:
-                    return None
-                b = bounds[display_id]
-                # CGDisplayBounds is top-left origin growing DOWN; a bitmap context
-                # is bottom-left origin growing UP - so a top-aligned SHORTER display
-                # does not sit at y=0 here, it sits above the gap beneath it.
-                rect = Quartz.CGRectMake(
-                    (b.origin.x - min_x) * max_scale,
-                    (max_y - (b.origin.y + b.size.height)) * max_scale,
-                    b.size.width * max_scale,
-                    b.size.height * max_scale,
-                )
-                Quartz.CGContextDrawImage(context, rect, image)
-
-            return Quartz.CGBitmapContextCreateImage(context)
         except BackendError:
-            # A guard refused (topology moved, budget spent, session locked) - fall
-            # back whole rather than composite a stale or partial canvas.
+            raise
+        except Exception:  # noqa: BLE001 - compositor unavailable; caller falls back
             return None
-        except Exception:  # noqa: BLE001 - never surface native detail; fall back
-            return None
+
+        # PHASE 2 - from here a child process may run, private files may exist on
+        # disk, and the per-display guards may refuse. NOTHING below is swallowed.
+        #
+        # The previous shape caught every BackendError here and returned None, which
+        # the caller read as "compositor unavailable" and answered with a legacy
+        # capture. Two consequences, both reproduced in review:
+        #   - a cleanup failure left a private capture file on disk while capture()
+        #     returned a legacy image as success: undisclosed retained data;
+        #   - a session that locked mid-capture had its post-child refusal swallowed,
+        #     and the legacy image was returned while the session was locked: an
+        #     explicit safety refusal bypassed.
+        # A guard that refuses must reach the caller, never be answered by trying a
+        # different capture.
+        for ordinal, display_id in enumerate(ids, start=1):
+            image = self._screencapture_display(
+                monitors[display_id], deadline, ordinal, ids
+            )
+            if image is None:
+                raise self._single_display_fallback_error(
+                    f"produced no image for display ordinal {ordinal} "
+                    "while compositing the virtual desktop"
+                )
+            b = bounds[display_id]
+            # CGDisplayBounds is top-left origin growing DOWN; a bitmap context
+            # is bottom-left origin growing UP - so a top-aligned SHORTER display
+            # does not sit at y=0 here, it sits above the gap beneath it.
+            rect = Quartz.CGRectMake(
+                (b.origin.x - min_x) * max_scale,
+                (max_y - (b.origin.y + b.size.height)) * max_scale,
+                b.size.width * max_scale,
+                b.size.height * max_scale,
+            )
+            Quartz.CGContextDrawImage(context, rect, image)
+
+        # FINAL CONSISTENCY CHECK. Each display was validated only around its OWN
+        # child capture, which leaves a real hole: display 1 passes its post-check,
+        # then changes GEOMETRY while `-D 2` is still running, with the active ID
+        # list and its order unchanged - so the per-display reorder check cannot
+        # see it either. Display 2 passes, and a composite placing display 1 at a
+        # width it no longer has is returned as current.
+        #
+        # So re-derive every placement input and compare against the snapshot the
+        # canvas was actually built from. Best effort by construction, not atomic
+        # topology access: these are independent reads and the layout can move
+        # again immediately after. What it guarantees is that a change OBSERVED by
+        # the time the composite is accepted invalidates it rather than shipping.
+        self._validate_composite_snapshot(ids, scales, bounds)
+
+        return Quartz.CGBitmapContextCreateImage(context)
+
+    def _validate_composite_snapshot(
+        self, ids: list[int], scales: dict[int, float], bounds: dict[int, Any]
+    ) -> None:
+        """Fail closed unless the whole layout still matches what was composited.
+
+        `scales` and `bounds` are the values the canvas geometry and every draw
+        rect were computed from. Re-reading them and comparing is the only way to
+        notice a display that moved or resized mid-composite while the ID list
+        stayed identical.
+        """
+        try:
+            current_ids = self._active_display_ids()
+            if current_ids != list(ids):
+                raise ValueError("active display list changed or reordered")
+            for display_id in ids:
+                if self._display_scale(display_id) != scales[display_id]:
+                    raise ValueError(f"display {display_id} backing scale changed")
+                was, now = bounds[display_id], Quartz.CGDisplayBounds(display_id)
+                if (
+                    was.origin.x,
+                    was.origin.y,
+                    was.size.width,
+                    was.size.height,
+                ) != (
+                    now.origin.x,
+                    now.origin.y,
+                    now.size.width,
+                    now.size.height,
+                ):
+                    raise ValueError(f"display {display_id} geometry changed")
+        except BackendError:
+            raise
+        except Exception:  # noqa: BLE001 - fail closed without native detail
+            raise self._single_display_fallback_error(
+                "refused: the display layout changed while the virtual desktop was "
+                "being composited, so the composite no longer describes the screen"
+            ) from None
 
     def capture(self, region: tuple[int, int, int, int] | None = None) -> bytes:
         """Return PNG bytes at native (physical-pixel) resolution.
@@ -1259,26 +1329,41 @@ class MacOSBackend:
         in the same unit.
 
         Whole-virtual-desktop path (`region=None` with more than one active display,
-        i.e. `monitors.VIRTUAL_DESKTOP` mode): falls back to
-        `CGWindowListCreateImage(CGRectInfinite, ...)`, which spans every display but
-        - per Apple's own documented behavior - renders at a resolution keyed off one
-        reference display's scale factor when displays disagree, an approximation for
-        genuinely mixed-DPI setups (not exercised on this backend's single-display
-        verification machine).
+        i.e. `monitors.VIRTUAL_DESKTOP` mode): composites the per-display guarded
+        captures into one canvas - the point-space bounding box of every active display
+        at the LARGEST backing scale among them, which reproduces exactly what
+        `CGWindowListCreateImage(CGRectInfinite, ...)` produces, including its
+        approximation for genuinely mixed-DPI setups (a 1x display is upscaled to the
+        2x canvas). That call remains the fallback when compositing is unavailable, but
+        is no longer the primary: it costs a flat 30.0s on macOS 26, which is also the
+        remote transport's per-op timeout. Verified on a mixed-DPI pair: same
+        13696x2880 output, 0.47s against 30.04s.
 
         Checked BEFORE any Quartz capture call, every time (never cached): a locked
         screen produces a real, plausible-looking `CGDisplayCreateImage` result, not
         `None` and not an exception - see `_macos_session_state()`'s module-level
         docstring for the real incident this refusal exists to prevent.
 
-        If that native per-display call returns `None`, a conservative alternative is
-        available only when the initial target was exactly one active display and it is
-        still the sole main display with unchanged physical geometry. It requires a
+        If that native per-display call returns `None`, a guarded `screencapture`
+        alternative runs for the display being captured: `-m` when it is the sole
+        active display (which must still be main, with unchanged geometry), else
+        `-D <1-based ordinal>` into the active display list, which must still contain
+        that display, with unchanged geometry and no reordering. Both forms require a
         fresh positive permission preflight and an unlocked session before and after
-        one bounded `screencapture -m` child. Its temporary PNG is decoded into memory
-        before cleanup, then follows this method's existing crop/encode path. This
-        does not apply to multi-display capture, cannot make topology or permission
-        checks atomic, and does not promise a hard capture wall time.
+        the child, decode the private temporary PNG into memory before cleanup, and
+        then follow this method's existing crop/encode path.
+
+        FAILURE POLICY. A guard that refuses - permission, session, topology, budget,
+        or a cleanup failure - propagates to the caller. It is never answered by
+        trying a different capture: that would hand back a legacy image taken after an
+        explicit refusal, or report success while a private capture file remained on
+        disk. The one condition that falls back to `CGWindowListCreateImage` is "this
+        platform cannot composite", decided entirely before any child runs or any file
+        exists; the session is re-read before that legacy call, because the call is
+        itself ~30s on macOS 26 and a locked screen returns a plausible-looking image.
+
+        None of this makes topology or permission use atomic, and none of it promises
+        a hard capture wall time.
         """
         fallback_deadline = time.monotonic() + 20.0
         state, detail = _macos_session_state()
@@ -1291,8 +1376,22 @@ class MacOSBackend:
             raise BackendError("no active displays; cannot capture the screen")
 
         if region is None and len(ids) > 1:
+            # A guard refusal inside the compositor propagates out of this call -
+            # it is never answered by trying a different capture. `None` means only
+            # "this platform cannot composite", which is the one case the legacy
+            # path may answer.
             cg_image = self._screencapture_virtual_desktop(ids, fallback_deadline)
             if cg_image is None:
+                # Re-read the session before the legacy call. The state check at the
+                # top of this method can be arbitrarily stale by now, and
+                # CGWindowListCreateImage is itself ~30s on macOS 26 - long enough
+                # for a screen to lock inside one capture. A locked screen returns a
+                # real, plausible-looking image, so nothing downstream would notice.
+                state, detail = _macos_session_state()
+                if state != "unlocked":
+                    raise BackendError(
+                        _session_state_error(state, detail, "capture a screenshot")
+                    )
                 cg_image = Quartz.CGWindowListCreateImage(
                     Quartz.CGRectInfinite,
                     Quartz.kCGWindowListOptionOnScreenOnly,

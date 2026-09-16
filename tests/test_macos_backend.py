@@ -1705,3 +1705,376 @@ def test_capture_fallback_discards_late_child_output(monkeypatch):
     with pytest.raises(BackendError, match="exceeded capture budget"):
         backend.capture()
     assert "argv" in seen
+
+
+# -- compositor harness: a fake Quartz that can ACTUALLY composite -------------
+#
+# The existing multi-display fake deliberately lacks the bitmap-context symbols,
+# so it exercises the "compositor unavailable -> legacy fallback" path and never
+# reaches the compositor itself. These tests need the opposite: a fake where the
+# compositor really runs, so its guard-failure behaviour is observable.
+
+
+class _CompositingQuartz(_SingleFallbackQuartz):
+    """Two displays, mixed-DPI, with working bitmap-context APIs.
+
+    Mirrors the real verification rig in shape: a 2x display at the origin beside
+    a 1x display to its right, so the canvas is the point-space bounding box at
+    the LARGEST backing scale.
+    """
+
+    kCGImageAlphaPremultipliedFirst = 1
+    kCGBitmapByteOrder32Little = 2
+    kCGWindowListOptionOnScreenOnly = 1
+    kCGNullWindowID = 0
+    kCGWindowImageDefault = 0
+    CGRectInfinite = "infinite"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._displays = {
+            7: {
+                "id": 7,
+                "bounds": (0, 0, 2, 1),
+                "pixel_w": 4,
+                "pixel_h": 2,
+                "main": True,
+            },
+            9: {
+                "id": 9,
+                "bounds": (2, 0, 4, 1),
+                "pixel_w": 4,
+                "pixel_h": 1,
+                "main": False,
+            },
+        }
+        self.drawn: list[tuple] = []
+        self.context_size: tuple[int, int] | None = None
+        self.legacy_calls = 0
+
+    def CGImageSourceCreateImageAtIndex(self, source, _index, _options):
+        # Decode the REAL dimensions the child wrote, so the guarded helper's
+        # "unexpected image dimensions" check is exercised honestly rather than
+        # always being handed one hard-coded size.
+        import struct
+
+        width, height = struct.unpack(">II", source[16:24])
+        return _FallbackImage(width, height, raw=source)
+
+    def CGColorSpaceCreateDeviceRGB(self):
+        return "COLORSPACE"
+
+    def CGBitmapContextCreate(self, _data, width, height, *_rest):
+        self.context_size = (width, height)
+        return "CONTEXT"
+
+    def CGContextDrawImage(self, _context, rect, image):
+        self.drawn.append((rect, image))
+
+    def CGBitmapContextCreateImage(self, _context):
+        return _FallbackImage(*self.context_size)
+
+    def CGWindowListCreateImage(self, *_args):
+        self.legacy_calls += 1
+        return _FallbackImage(12, 4)
+
+
+@pytest.fixture
+def compositing_backend(monkeypatch, tmp_path):
+    """Backend + fake whose per-display children write real synthetic PNGs."""
+    fake = _CompositingQuartz()
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(macos, "_macos_session_state", lambda: ("unlocked", "test"))
+    monkeypatch.setattr(macos, "_cg_preflight_screen_capture_access", lambda: True)
+    monkeypatch.setitem(
+        sys.modules,
+        "CoreFoundation",
+        types.SimpleNamespace(CFDataCreate=lambda _alloc, raw, length: raw[:length]),
+    )
+    seen: dict = {"argv": []}
+
+    def fake_run(argv, **_kwargs):
+        seen["argv"].append(list(argv))
+        ordinal = int(argv[argv.index("-D") + 1])
+        display = list(fake._displays.values())[ordinal - 1]
+        Path(argv[-1]).write_bytes(
+            _synthetic_png(display["pixel_w"], display["pixel_h"])
+        )
+        return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(macos.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        MacOSBackend, "_encode_png", staticmethod(lambda image: b"composite")
+    )
+    return MacOSBackend({}), fake, seen
+
+
+def _synthetic_png(width: int = 4, height: int = 2) -> bytes:
+    import io
+
+    from PIL import Image
+
+    data = io.BytesIO()
+    Image.new("RGB", (width, height), (1, 2, 3)).save(data, format="PNG")
+    return data.getvalue()
+
+
+# -- blocker 1: safety/cleanup failures must reach the caller -----------------
+#
+# The compositor used to catch EVERY BackendError and return None, which the
+# caller reads as "compositor unavailable" and answers with a legacy capture.
+# Both cases below were reproduced in review: one leaves a private capture file
+# on disk while reporting success, the other returns an image from a session
+# that had explicitly refused.
+
+
+def test_compositor_cleanup_failure_reaches_the_caller(
+    compositing_backend, monkeypatch, tmp_path
+):
+    backend, fake, _seen = compositing_backend
+    real_rmtree = macos.shutil.rmtree
+    monkeypatch.setattr(
+        macos.shutil,
+        "rmtree",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("cleanup denied")),
+    )
+
+    with pytest.raises(BackendError) as excinfo:
+        backend.capture()
+
+    assert "cleanup failed" in str(excinfo.value)
+    assert "private capture data may remain" in str(excinfo.value)
+    assert fake.legacy_calls == 0, (
+        "a retained-data failure must never be answered with another capture"
+    )
+
+    # The retained file IS the condition under test, so this test deliberately
+    # leaves one behind. Remove it with the real shutil so the suite-wide
+    # "capture storage leaked" guard still means what it says for every other
+    # test - the leak is asserted above, not tolerated here.
+    for leaked in tmp_path.glob("amplifier-cu-capture-*"):
+        real_rmtree(leaked, ignore_errors=True)
+
+
+def test_compositor_lock_transition_refusal_reaches_the_caller(
+    compositing_backend, monkeypatch
+):
+    """Unlocked at entry, locked by the post-child guard: the refusal must not be
+    swallowed and answered with a legacy image taken on a locked screen."""
+    backend, fake, _seen = compositing_backend
+    states = iter([("unlocked", "test"), ("locked", "CGSSessionScreenIsLocked=True")])
+    monkeypatch.setattr(
+        macos,
+        "_macos_session_state",
+        lambda: next(states, ("locked", "CGSSessionScreenIsLocked=True")),
+    )
+
+    with pytest.raises(BackendError) as excinfo:
+        backend.capture()
+
+    assert "not unlocked" in str(excinfo.value) or "LOCKED" in str(excinfo.value)
+    assert fake.legacy_calls == 0, "an explicit refusal must not be bypassed"
+
+
+def test_compositor_unavailable_still_falls_back_to_legacy(monkeypatch):
+    """The one benign class: no bitmap-context symbols means this platform cannot
+    composite. That is not a safety failure and the legacy path may answer it."""
+    fake = _FakeQuartz(
+        [
+            {"id": 7, "bounds": (0, 0, 2, 1), "pixel_w": 2, "pixel_h": 1, "main": True},
+            {
+                "id": 9,
+                "bounds": (2, 0, 2, 1),
+                "pixel_w": 2,
+                "pixel_h": 1,
+                "main": False,
+            },
+        ]
+    )
+    fake.CGWindowListCreateImage = lambda *_a: "legacy"
+    fake.CGRectInfinite = "infinite"
+    fake.kCGWindowListOptionOnScreenOnly = 1
+    fake.kCGNullWindowID = 0
+    fake.kCGWindowImageDefault = 0
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(macos, "_macos_session_state", lambda: ("unlocked", "test"))
+    monkeypatch.setattr(
+        MacOSBackend, "_encode_png", staticmethod(lambda image: image.encode())
+    )
+
+    assert MacOSBackend({}).capture() == b"legacy"
+
+
+def test_legacy_fallback_rechecks_the_session_before_capturing(monkeypatch):
+    """capture() used to call the legacy API with no fresh session read. That call
+    is ~30s on macOS 26 - long enough for a screen to lock inside one capture, and
+    a locked screen returns a real, plausible-looking image."""
+    fake = _FakeQuartz(
+        [
+            {"id": 7, "bounds": (0, 0, 2, 1), "pixel_w": 2, "pixel_h": 1, "main": True},
+            {
+                "id": 9,
+                "bounds": (2, 0, 2, 1),
+                "pixel_w": 2,
+                "pixel_h": 1,
+                "main": False,
+            },
+        ]
+    )
+    fake.CGWindowListCreateImage = lambda *_a: pytest.fail(
+        "legacy capture ran on a locked session"
+    )
+    fake.CGRectInfinite = "infinite"
+    fake.kCGWindowListOptionOnScreenOnly = 1
+    fake.kCGNullWindowID = 0
+    fake.kCGWindowImageDefault = 0
+    monkeypatch.setattr(macos, "Quartz", fake)
+    states = iter([("unlocked", "test")])
+    monkeypatch.setattr(
+        macos,
+        "_macos_session_state",
+        lambda: next(states, ("locked", "CGSSessionScreenIsLocked=True")),
+    )
+
+    with pytest.raises(BackendError, match="LOCKED"):
+        MacOSBackend({}).capture()
+
+
+# -- blocker 2: the whole layout must still match when the composite is accepted
+
+
+def test_composite_rejected_when_a_display_resizes_during_another_capture(
+    compositing_backend, monkeypatch
+):
+    """The exact interleaving reported in review.
+
+    Display 7 passes its own post-capture check. While `-D 2` runs, display 7
+    changes GEOMETRY - and the active ID list and its order are untouched, so the
+    per-display reorder check cannot see it. Without a final whole-layout check
+    the composite is returned with display 7 drawn at a width it no longer has.
+    """
+    backend, fake, seen = compositing_backend
+    real_bounds = fake.CGDisplayBounds
+
+    calls = {"n": 0}
+
+    def shifting_bounds(display_id):
+        # Let setup and the per-display checks see the original layout; widen
+        # display 7 only once both children have run.
+        calls["n"] += 1
+        if display_id == 7 and calls["n"] > 6:
+            return _FakeRect(0, 0, 3, 1)
+        return real_bounds(display_id)
+
+    monkeypatch.setattr(fake, "CGDisplayBounds", shifting_bounds)
+
+    with pytest.raises(BackendError) as excinfo:
+        backend.capture()
+
+    message = str(excinfo.value)
+    assert "layout changed" in message
+    assert "no longer describes the screen" in message
+    assert fake.legacy_calls == 0, (
+        "a stale-composite refusal must not be answered with another capture"
+    )
+    assert len(seen["argv"]) == 2, "both displays were captured before the refusal"
+
+
+def test_composite_rejected_when_the_display_list_reorders(
+    compositing_backend, monkeypatch
+):
+    backend, fake, _seen = compositing_backend
+    real_ids = MacOSBackend._active_display_ids
+    calls = {"n": 0}
+
+    def reordering(self):
+        calls["n"] += 1
+        ids = real_ids(self)
+        return list(reversed(ids)) if calls["n"] > 5 else ids
+
+    monkeypatch.setattr(MacOSBackend, "_active_display_ids", reordering)
+
+    with pytest.raises(BackendError):
+        backend.capture()
+
+    assert fake.legacy_calls == 0
+
+
+def test_composite_accepted_when_the_layout_is_unchanged(compositing_backend):
+    """The final check must not reject a stable layout - it runs on every
+    successful composite, so a false positive here would break capture outright."""
+    backend, fake, seen = compositing_backend
+
+    assert backend.capture() == b"composite"
+    assert fake.legacy_calls == 0
+    # displays 7 (2x1 points, 2x scale) and 9 (4x1 points, 1x scale) side by side:
+    # point bounding box 6x1, canvas at the LARGEST scale -> 12x2.
+    assert fake.context_size == (12, 2)
+    rects = [rect for rect, _image in fake.drawn]
+    assert rects[0] == (0, 0, 4, 2), "2x display placed at its native pixel size"
+    assert rects[1] == (4, 0, 8, 2), "1x display upscaled 2x, placed to its right"
+    assert len(seen["argv"]) == 2
+
+
+# -- the argv the compositor actually builds ----------------------------------
+#
+# The existing region test monkeypatches `_screencapture_display` away, so it
+# never sees a real argument list. These drive the genuine helper and inspect
+# what would reach the child process.
+
+
+def test_compositor_builds_a_per_display_ordinal_argv(compositing_backend):
+    """`-D` is a 1-BASED INDEX into the active display list, not a CGDirectDisplayID.
+
+    Passing an id straight through captures the wrong screen, or nothing. That
+    mapping is verified against real hardware by image content (see the
+    compositor docstring); this pins the argument construction itself.
+    """
+    backend, _fake, seen = compositing_backend
+
+    assert backend.capture() == b"composite"
+
+    assert len(seen["argv"]) == 2
+    first, second = seen["argv"]
+    assert first[:2] == ["/usr/sbin/screencapture", "-x"]
+    assert "-m" not in first, "a secondary-capable path must never use -m"
+    assert first[first.index("-D") + 1] == "1"
+    assert second[second.index("-D") + 1] == "2"
+    assert first[-1] != second[-1], "each display gets its own private temp file"
+
+
+def test_single_display_path_still_uses_m_not_an_ordinal(monkeypatch, tmp_path):
+    """The sole-display contract is unchanged: `-m`, no ordinal.
+
+    Guards the seam from the other side - the generalisation must not silently
+    convert the single-display fallback into an ordinal capture.
+    """
+    backend, fake = _fallback_backend(monkeypatch)
+    seen: dict = {}
+
+    def fake_run(argv, **_kwargs):
+        seen["argv"] = list(argv)
+        Path(argv[-1]).write_bytes(_synthetic_png(4, 2))
+        return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(macos.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        MacOSBackend, "_encode_png", staticmethod(lambda _image: b"single")
+    )
+
+    assert backend.capture() == b"single"
+    assert "-m" in seen["argv"]
+    assert "-D" not in seen["argv"]
+
+
+def test_compositor_runs_for_real_in_the_multi_display_branch(compositing_backend):
+    """The gap Brian named: the pre-existing multi-display test reaches the LEGACY
+    path because its fake lacks the bitmap-context APIs, so nothing exercised the
+    compositor at all. This one asserts the compositor genuinely ran."""
+    backend, fake, seen = compositing_backend
+
+    assert backend.capture() == b"composite"
+    assert fake.context_size is not None, "no bitmap context was ever created"
+    assert len(fake.drawn) == 2, "both displays must be drawn into the canvas"
+    assert fake.legacy_calls == 0, "the legacy path must not run when compositing works"
+    assert len(seen["argv"]) == 2, "one child process per display"
