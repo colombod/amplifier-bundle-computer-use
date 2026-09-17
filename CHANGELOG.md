@@ -38,17 +38,38 @@ line declared in `modules/tool-computer-use/pyproject.toml` and
 - Generalised that fallback from "the sole display" to "one display at a time", which is
   what the default configuration actually needs: `target_monitor` defaults to `"primary"`,
   so per-monitor capture routes through the per-display path, not the whole-virtual-desktop
-  branch - and on macOS 26 a second attached display therefore broke *every* ordinary
+  branch - and on **macOS 26.6.2** a second attached display therefore broke *every* ordinary
   screenshot with an error blaming a display that was awake and capturable. Same guards,
   `-D <1-based ordinal>` instead of `-m`, plus an active-display-list reorder check that the
   sole-display form did not need. `-D`'s mapping to `CGGetActiveDisplayList` order is
   verified by image CONTENT on macOS 26.6.2, not by size.
-- Whole-virtual-desktop capture on multi-display Macs running macOS 26, which hit a flat
-  30.0s `CGWindowListCreateImage` cost - also the remote transport's per-op timeout, so it
-  dropped the connection instead of returning an image. Composites per-display captures into
-  the identical canvas (point-space bounding box at the largest backing scale). Verified on a
-  mixed-DPI rig (2x built-in beside a 1x ultrawide): same 13696x2880 output, 30.04s -> 0.47s.
-  Falls back to the original call if the composite cannot be built.
+- Whole-virtual-desktop capture on multi-display Macs running **macOS 26.6.2**, which hit a
+  flat 30.0s `CGWindowListCreateImage` cost - also the remote transport's per-op timeout, so
+  it dropped the connection instead of returning an image. Composites per-display captures
+  into the identical canvas (point-space bounding box at the largest backing scale). Verified
+  on a mixed-DPI rig (2x built-in beside a 1x ultrawide): same 13696x2880 output,
+  30.04s -> 0.47s.
+- **Native capture stays primary on every path; this module's `screencapture` work is the
+  fallback.** `CGDisplayCreateImage` and `CGWindowListCreateImage` answer a capture whenever
+  they are healthy, so on a macOS where they are, none of the above ever runs. Measured on
+  one machine across an OS update: on **26.6.2 (25G83)** `CGDisplayCreateImage` blocked ~5.0s
+  and returned `NULL` while `CGWindowListCreateImage` took 30.04s to return a correct image;
+  on **26.7 (25G229)** the same calls took 0.02-0.08s and 0.07s. Those are measurements of
+  those two releases - no behaviour is inferred for any other, and there is no OS-version
+  comparison anywhere in the backend.
+- A native call that behaves pathologically once - returning `NULL`, **or** returning a
+  correct image after tens of seconds - is latched as degraded and not attempted again in
+  that process. Only the duration catches the second signature. The latch is per backend
+  instance and never persisted, so an OS update takes effect on the next session with no
+  cache to invalidate. This also removes the ~5s-per-screenshot cost on 26.6.x, where the
+  dead call was previously re-made on every capture.
+- A whole-desktop capture that cannot set up the compositor is now **reported rather than
+  answered by retrying** `CGWindowListCreateImage`: reaching that point means the native call
+  was already skipped as degraded, and re-attempting it costs ~30s on the macOS where that is
+  true, which is also the transport's per-op timeout.
+- The session is re-read after the health probe and before the real native capture. The probe
+  is itself a native call that consumes wall-clock, so it is a window in which a screen can
+  lock between the entry check and the capture that check was meant to guard.
 - Added a narrow macOS fallback after native per-display capture returns `None`: one bounded
   `screencapture -m` attempt for an unchanged single active main display, with fresh
   preflight, lock/topology checks, private temporary storage, and in-memory PNG decoding.

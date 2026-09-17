@@ -1876,9 +1876,16 @@ def test_compositor_lock_transition_refusal_reaches_the_caller(
     assert fake.legacy_calls == 0, "an explicit refusal must not be bypassed"
 
 
-def test_compositor_unavailable_still_falls_back_to_legacy(monkeypatch):
-    """The one benign class: no bitmap-context symbols means this platform cannot
-    composite. That is not a safety failure and the legacy path may answer it."""
+def test_missing_probe_symbol_lets_the_native_call_answer_directly(monkeypatch):
+    """RENAMED from `..._compositor_unavailable_still_falls_back_to_legacy`.
+
+    That name described a path this test never took. Instrumented in review: the
+    compositor was entered ZERO times. The fake lacks the preliminary probe
+    symbol, that exception is (deliberately) swallowed, and the native call then
+    answers directly - so what this actually covers is a missing probe symbol
+    being harmless, not a compositor fallback. The real unavailable-compositor
+    path is covered by the test below.
+    """
     fake = _FakeQuartz(
         [
             {"id": 7, "bounds": (0, 0, 2, 1), "pixel_w": 2, "pixel_h": 1, "main": True},
@@ -1898,11 +1905,80 @@ def test_compositor_unavailable_still_falls_back_to_legacy(monkeypatch):
     fake.kCGWindowImageDefault = 0
     monkeypatch.setattr(macos, "Quartz", fake)
     monkeypatch.setattr(macos, "_macos_session_state", lambda: ("unlocked", "test"))
+    entered: list[int] = []
+    monkeypatch.setattr(
+        MacOSBackend,
+        "_screencapture_virtual_desktop",
+        lambda self, ids, deadline: entered.append(1),
+    )
     monkeypatch.setattr(
         MacOSBackend, "_encode_png", staticmethod(lambda image: image.encode())
     )
 
     assert MacOSBackend({}).capture() == b"legacy"
+    assert entered == [], "this path never reaches the compositor - that is the point"
+
+
+def test_unavailable_compositor_reports_failure_and_does_not_retry_legacy(
+    monkeypatch,
+):
+    """The REAL unavailable-compositor path, which nothing covered before.
+
+    Degraded native (so the whole-desktop call is skipped) plus no bitmap-context
+    APIs (so compositing cannot be set up). The compositor IS entered, declines
+    during setup, and capture() reports the failure.
+
+    It must NOT answer that by retrying the legacy call: the native call is
+    already known degraded, and on the macOS where that is true it costs ~30s and
+    drops the transport. Failing loudly is the safe behaviour, not a regression
+    against the old test's name.
+    """
+    fake = _FakeQuartz(
+        [
+            {"id": 7, "bounds": (0, 0, 2, 1), "pixel_w": 2, "pixel_h": 1, "main": True},
+            {
+                "id": 9,
+                "bounds": (2, 0, 2, 1),
+                "pixel_w": 2,
+                "pixel_h": 1,
+                "main": False,
+            },
+        ]
+    )
+    legacy_calls: list[int] = []
+
+    def legacy(*_args):
+        legacy_calls.append(1)
+        return "legacy"
+
+    fake.CGDisplayCreateImage = lambda _display_id: None  # degrades the backend
+    fake.CGWindowListCreateImage = legacy
+    fake.CGRectInfinite = "infinite"
+    fake.kCGWindowListOptionOnScreenOnly = 1
+    fake.kCGNullWindowID = 0
+    fake.kCGWindowImageDefault = 0
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(macos, "_macos_session_state", lambda: ("unlocked", "test"))
+
+    backend = MacOSBackend({})
+    entered: list[int] = []
+    real_compositor = MacOSBackend._screencapture_virtual_desktop
+
+    def counting_compositor(self, ids, deadline):
+        entered.append(1)
+        return real_compositor(self, ids, deadline)
+
+    monkeypatch.setattr(
+        MacOSBackend, "_screencapture_virtual_desktop", counting_compositor
+    )
+
+    with pytest.raises(BackendError) as excinfo:
+        backend.capture()
+
+    assert entered == [1], "the compositor must actually be entered"
+    assert legacy_calls == [], "a degraded native call must not be retried"
+    assert "compositor" in str(excinfo.value)
+    assert backend._native_capture_degraded is True
 
 
 def test_session_is_rechecked_before_compositing(compositing_backend, monkeypatch):
@@ -2199,3 +2275,70 @@ def test_degraded_state_is_per_instance_and_never_persisted(compositing_backend)
     backend._native_capture_degraded = True
 
     assert MacOSBackend({})._native_capture_degraded is False
+
+
+# -- the health probe is itself a guarded window -------------------------------
+#
+# The preliminary CGDisplayCreateImage probe is not free: it is a real native
+# capture that consumes real wall-clock, so it is a window in which the screen
+# can lock BETWEEN capture()'s entry check and the whole-desktop capture that
+# check was meant to guard. Reported in review with both signatures reproduced.
+
+
+@pytest.mark.parametrize("probe_outcome", ["fast_valid", "raises"])
+def test_session_is_rechecked_between_the_probe_and_the_native_capture(
+    compositing_backend, monkeypatch, probe_outcome
+):
+    """Lock during the probe -> refuse, and never start the whole-desktop call.
+
+    Both probe outcomes that do NOT mark degraded are covered. The slow-probe
+    case already refused (it marks degraded and routes to the compositor, which
+    re-reads); these two skipped straight past the stale check.
+    """
+    backend, fake, _seen = compositing_backend
+    native_calls: list[str] = []
+
+    def probe(_display_id):
+        if probe_outcome == "raises":
+            raise AttributeError("CGDisplayCreateImage unavailable")
+        return _FallbackImage(4, 2)
+
+    def whole_desktop(*_args):
+        native_calls.append("CGWindowListCreateImage")
+        return _FallbackImage(12, 2)
+
+    monkeypatch.setattr(fake, "CGDisplayCreateImage", probe)
+    monkeypatch.setattr(fake, "CGWindowListCreateImage", whole_desktop)
+    # unlocked at entry, locked by the time the probe has finished
+    states = iter([("unlocked", "entry"), ("locked", "CGSSessionScreenIsLocked=True")])
+    monkeypatch.setattr(
+        macos,
+        "_macos_session_state",
+        lambda: next(states, ("locked", "CGSSessionScreenIsLocked=True")),
+    )
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *_a, **_k: pytest.fail("a child ran on a locked session"),
+    )
+
+    with pytest.raises(BackendError, match="LOCKED"):
+        backend.capture()
+
+    assert native_calls == [], (
+        "the whole-desktop native capture must not start on a locked session"
+    )
+
+
+def test_probe_that_answers_normally_does_not_add_a_spurious_refusal(
+    compositing_backend, monkeypatch
+):
+    """The re-read must not become a second failure mode on a healthy system."""
+    backend, fake, seen = compositing_backend
+    monkeypatch.setattr(fake, "CGDisplayCreateImage", lambda _d: _FallbackImage(4, 2))
+    monkeypatch.setattr(
+        fake, "CGWindowListCreateImage", lambda *_a: _FallbackImage(12, 2)
+    )
+
+    assert backend.capture() == b"composite"
+    assert fake.drawn == [] and seen["argv"] == [], "compositor must stay unused"

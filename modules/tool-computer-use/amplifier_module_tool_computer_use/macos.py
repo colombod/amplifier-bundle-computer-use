@@ -1425,7 +1425,14 @@ class MacOSBackend:
         which reproduces what that call itself produces, including its approximation
         for genuinely mixed-DPI setups (a 1x display is upscaled to the 2x canvas).
         Verified against it on a mixed-DPI pair: same 13696x2880 output, 0.47s against
-        that call's 30.04s on macOS 26.6.2, where it was pathological.
+        that call's 30.04s on macOS 26.6.2, where it was pathological. On 26.7 the
+        same call takes 0.07s and this compositor never runs. Both are measurements
+        of those two releases; nothing here infers behaviour on any other.
+
+        `-D` ordinals index `CGGetActiveDisplayList`, whose documented contract puts
+        the main display first - this relies on that contract rather than re-checking
+        it. Secondary ordering with three or more displays is an explicitly unverified
+        configuration.
 
         NATIVE FIRST, both here and on the per-display path below - see
         `_call_native`. Nothing in this backend compares OS versions; a native call
@@ -1449,15 +1456,26 @@ class MacOSBackend:
 
         FAILURE POLICY. A guard that refuses - permission, session, topology, budget,
         or a cleanup failure - propagates to the caller. It is never answered by
-        trying a different capture: that would hand back a legacy image taken after an
+        trying a different capture: that would hand back an image taken after an
         explicit refusal, or report success while a private capture file remained on
-        disk. The one condition that falls back to `CGWindowListCreateImage` is "this
-        platform cannot composite", decided entirely before any child runs or any file
-        exists; the session is re-read before that legacy call, because the call is
-        itself ~30s on macOS 26 and a locked screen returns a plausible-looking image.
+        disk.
+
+        There is NO retry of `CGWindowListCreateImage` when the compositor cannot be
+        set up. Reaching the compositor at all means the native call was skipped as
+        degraded, and retrying a call already known to be pathological costs ~30s on
+        the macOS where that is true - which is also the transport's per-op timeout,
+        so the "retry" drops the connection rather than producing an image. That
+        condition is reported instead.
+
+        The session is re-read at two points where wall-clock has passed since this
+        method's entry check: after the health probe and before the real native
+        capture, and before compositing. Both exist because a native capture call is
+        not free - it is time in which a screen can lock, after which a locked screen
+        returns a real, plausible-looking image that nothing downstream questions.
 
         None of this makes topology or permission use atomic, and none of it promises
-        a hard capture wall time.
+        a hard capture wall time - the budget is elapsed-time accounting for the
+        child, not a native-call deadline, which CoreGraphics does not offer.
         """
         fallback_deadline = time.monotonic() + 20.0
         state, detail = _macos_session_state()
@@ -1478,6 +1496,19 @@ class MacOSBackend:
             cg_image = None
             self._learn_native_capture_health(ids)
             if not self._native_capture_degraded:
+                # The probe above is not free. It is a real native capture call
+                # that consumes real wall-clock - up to ~5s on a degraded system -
+                # which makes it a window in which the screen can lock, between
+                # this method's entry check and the capture that check was meant
+                # to guard. Whether the probe answered fast, or raised, it moved
+                # time forward, so the session has to be read again before the
+                # actual whole-desktop capture starts. This is a NEW intervening
+                # call introduced by native-first; it does not exist upstream.
+                state, detail = _macos_session_state()
+                if state != "unlocked":
+                    raise BackendError(
+                        _session_state_error(state, detail, "capture a screenshot")
+                    )
                 cg_image = self._call_native(
                     Quartz.CGWindowListCreateImage,
                     Quartz.CGRectInfinite,

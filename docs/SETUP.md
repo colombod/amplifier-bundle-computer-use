@@ -688,13 +688,19 @@ of this change.
 **Failure policy.** A guard that refuses — permission, session, topology, budget, or a
 cleanup failure — is reported to the caller. It is never answered by trying a different
 capture: doing so would return an image taken after an explicit refusal, or report success
-while a private capture file remained on disk. The **only** condition that falls back from
-the compositor is "this platform cannot composite" (for example a pyobjc without the
-bitmap-context symbols), which is decided entirely before any child process runs or any file
-exists. The session state is re-read before compositing, because reaching that point means a
-native call already ran and a degraded one can burn 30s on its own — long enough for a
-screen to lock inside a single capture, after which a locked screen returns a real,
-plausible-looking image.
+while a private capture file remained on disk.
+
+If the compositor itself cannot be set up — for example a pyobjc without the bitmap-context
+symbols — that is **reported, not retried**. There is deliberately no fallback to
+`CGWindowListCreateImage` at that point: reaching the compositor means the native call was
+already skipped as degraded, and re-attempting a call known to be pathological costs ~30s on
+the macOS where that is true, which is also the SSH transport's per-op timeout. The "retry"
+would drop the connection rather than produce an image.
+
+The session state is re-read at **two** points where wall-clock has passed since the entry
+check: after the health probe and before the real native capture, and again before
+compositing. A native capture call is not free, and the time it consumes is time in which a
+screen can lock — after which a locked screen returns a real, plausible-looking image.
 
 This is a conservative fallback, not a permission prompt or reset. A positive preflight does
 not establish that the utility has the same TCC attribution, and none of these checks can
@@ -724,12 +730,25 @@ outright on macOS 26 without the per-display form — returned an exact 800x600 
 non-top-aligned display arrangements, and whether `-m` still follows the main display when
 main is not the first active display (in the verified arrangement it was).
 
-What that run does **not** establish, stated so it is not inferred: nothing about multiple
-active displays (out of scope here - see PR #11), three or more displays, non-top-aligned
-arrangements, or whether `-m` still follows the main display when main is not the first
-active display. A positive preflight still does not establish that the utility has the same
-TCC attribution, and the topology and permission checks remain non-atomic regardless of this
-result. The capture-alternative lead was reported by
+**Known limits, accepted deliberately rather than left ambiguous:**
+
+- **Mixed-DPI screenshot/input coordinate mismatch** — inherited from the pre-existing
+  backend, not introduced here. A virtual-desktop screenshot spans displays at the largest
+  backing scale, while input coordinates map through a single scale factor. Fixing it means
+  per-display coordinate mapping in the *input* path and its own hardware verification, so
+  it is out of scope for this capture work.
+- **No hard native-call deadline.** CoreGraphics offers no way to cancel a capture call in
+  flight. The 20-second budget is elapsed-time accounting for the child process; a
+  pathological native call is bounded by *never being repeated*, not by being interrupted.
+- **Three or more displays, and secondary `-D` ordering there**, are unverified. `-D`
+  ordinals index `CGGetActiveDisplayList`, whose contract puts main first; that contract is
+  relied upon rather than re-checked.
+- **Non-top-aligned arrangements** and whether `-m` follows main when main is not the first
+  active display are unverified — in every verified arrangement it was.
+- A positive preflight still does not establish that the `screencapture` utility has the same
+  TCC attribution, and the topology and permission checks remain non-atomic.
+
+The capture-alternative lead was reported by
 [@colombod in PR #11](https://github.com/microsoft/amplifier-bundle-computer-use/pull/11).
 
 ---
