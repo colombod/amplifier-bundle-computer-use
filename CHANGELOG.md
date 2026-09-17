@@ -61,12 +61,12 @@ line declared in `modules/tool-computer-use/pyproject.toml` and
   correct image after tens of seconds - is latched as degraded and not attempted again in
   that process. Only the duration catches the second signature. The latch is per backend
   instance and never persisted, so an OS update takes effect on the next session with no
-  cache to invalidate. This also removes the ~5s-per-screenshot cost on 26.6.x, where the
+  cache to invalidate. This also removes the ~5s-per-screenshot cost on measured 26.6.2, where the
   dead call was previously re-made on every capture.
 - A whole-desktop capture that cannot set up the compositor is now **reported rather than
   answered by retrying** `CGWindowListCreateImage`: reaching that point means the native call
-  was already skipped as degraded, and re-attempting it costs ~30s on the macOS where that is
-  true, which is also the transport's per-op timeout.
+  was skipped as degraded or returned `None`. Re-attempting a pathological call costs ~30s on
+  the measured macOS 26.6.2, which is also the transport's per-op timeout.
 - The session is re-read after the health probe and before the real native capture. The probe
   is itself a native call that consumes wall-clock, so it is a window in which a screen can
   lock between the entry check and the capture that check was meant to guard.

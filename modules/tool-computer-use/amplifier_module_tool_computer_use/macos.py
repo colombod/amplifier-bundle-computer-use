@@ -1252,8 +1252,8 @@ class MacOSBackend:
     def _screencapture_virtual_desktop(self, ids: list[int], deadline: float) -> Any:
         """Composite one guarded per-display capture into the virtual desktop image.
 
-        A drop-in for `CGWindowListCreateImage(CGRectInfinite, ...)`, which on macOS 26
-        still returns correct pixels but takes a flat 30.0s per call - measured
+        A fallback for `CGWindowListCreateImage(CGRectInfinite, ...)`, which on the
+        measured macOS 26.6.2 returned correct pixels but took ~30.0s per call:
         30.07/30.01/30.00s single-display and 30.04s with two displays attached. That
         is also `SshTransport.send()`'s per-op timeout, so over the remote transport
         this path does not return a slow image, it drops the connection.
@@ -1277,13 +1277,15 @@ class MacOSBackend:
             -D 1 vs reference(id 1)   7.83      -D 2 vs reference(id 3)   1.85
             -D 1 vs reference(id 3)  76.03      -D 2 vs reference(id 1)  74.82
 
-        Returns `None` (never raises) if any display cannot be captured, so the caller
-        falls back to the original call rather than shipping a partial canvas.
+        Returns `None` if compositor setup is unavailable or no final image is
+        produced. Guard, per-display capture, topology, and cleanup failures
+        propagate to the caller. `capture()` reports an unavailable composite
+        without retrying native capture or returning a partial canvas.
         """
         # PHASE 1 - setup only. Nothing here starts a child process, touches disk,
-        # or consults a guard, so a failure means "this platform cannot composite"
-        # (e.g. a pyobjc without the bitmap-context symbols) and falling back is
-        # correct. This is the ONLY phase whose failures are swallowed.
+        # or consults a guard. Unavailable setup (e.g. missing bitmap-context
+        # symbols) returns None for capture() to report, not to retry native
+        # capture. BackendError still propagates, including during setup.
         try:
             scales = {d: self._display_scale(d) for d in ids}
             bounds = {d: Quartz.CGDisplayBounds(d) for d in ids}
@@ -1315,7 +1317,7 @@ class MacOSBackend:
                 return None
         except BackendError:
             raise
-        except Exception:  # noqa: BLE001 - compositor unavailable; caller falls back
+        except Exception:  # noqa: BLE001 - unavailable setup; caller reports failure
             return None
 
         # PHASE 2 - from here a child process may run, private files may exist on
@@ -1461,8 +1463,8 @@ class MacOSBackend:
         disk.
 
         There is NO retry of `CGWindowListCreateImage` when the compositor cannot be
-        set up. Reaching the compositor at all means the native call was skipped as
-        degraded, and retrying a call already known to be pathological costs ~30s on
+        set up. The native call was either skipped as degraded or returned None.
+        Retrying a call already known to be pathological costs ~30s on
         the macOS where that is true - which is also the transport's per-op timeout,
         so the "retry" drops the connection rather than producing an image. That
         condition is reported instead.

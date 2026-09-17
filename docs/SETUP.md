@@ -692,8 +692,8 @@ while a private capture file remained on disk.
 
 If the compositor itself cannot be set up — for example a pyobjc without the bitmap-context
 symbols — that is **reported, not retried**. There is deliberately no fallback to
-`CGWindowListCreateImage` at that point: reaching the compositor means the native call was
-already skipped as degraded, and re-attempting a call known to be pathological costs ~30s on
+`CGWindowListCreateImage` at that point: the native call was either skipped as degraded or
+returned `None`. Re-attempting a call known to be pathological costs ~30s on
 the macOS where that is true, which is also the SSH transport's per-op timeout. The "retry"
 would drop the connection rather than produce an image.
 
@@ -726,9 +726,8 @@ genuinely mixed-DPI pair — a 2x built-in (1728x1117 points at the origin) besi
 `CGWindowListCreateImage` in 0.47s against its 30.04s, and region capture — which fails
 outright on macOS 26.6.2 without the per-display form — returned an exact 800x600 crop.
 
-**Not** covered by any of those runs, stated so it is not inferred: three or more displays,
-non-top-aligned display arrangements, and whether `-m` still follows the main display when
-main is not the first active display (in the verified arrangement it was).
+**Not** covered by any of those runs, stated so it is not inferred: three or more displays
+and non-top-aligned display arrangements.
 
 **Known limits, accepted deliberately rather than left ambiguous:**
 
@@ -743,8 +742,7 @@ main is not the first active display (in the verified arrangement it was).
 - **Three or more displays, and secondary `-D` ordering there**, are unverified. `-D`
   ordinals index `CGGetActiveDisplayList`, whose contract puts main first; that contract is
   relied upon rather than re-checked.
-- **Non-top-aligned arrangements** and whether `-m` follows main when main is not the first
-  active display are unverified — in every verified arrangement it was.
+- **Non-top-aligned arrangements** are unverified.
 - A positive preflight still does not establish that the `screencapture` utility has the same
   TCC attribution, and the topology and permission checks remain non-atomic.
 
