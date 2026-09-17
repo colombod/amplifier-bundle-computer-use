@@ -622,6 +622,44 @@ problems with different fixes:
 
 ---
 
+### Narrow macOS single-display capture fallback
+
+If native `CGDisplayCreateImage` returns `None`, capture may make one bounded
+`/usr/sbin/screencapture -m` attempt **only** when exactly one active display remains the
+main display with unchanged physical geometry. Before launching it, the backend requires a
+fresh positive Screen Recording preflight and an unlocked session; it rechecks the unlocked
+state and display identity after the child, decodes the private temporary PNG into memory,
+and rejects unexpected dimensions. The temporary directory and file are private; cleanup
+is attempted on every path. A cleanup failure is reported explicitly because private
+capture data may remain.
+
+This is a conservative fallback, not a permission prompt or reset. A positive preflight does
+not establish that the utility has the same TCC attribution, and the checks cannot make
+topology or permission use atomic. The 20-second fallback budget includes prior capture and
+setup work; the child receives only time remaining. It leaves a usual 10-second margin below
+the default 30-second wire timeout for encoding, but does not guarantee a hard wall time.
+Multi-display/virtual-desktop capture and region capture while multiple displays are active
+remain outside this fallback's scope. Existing diagnostics are unchanged and this does not
+claim to diagnose or fix a physical display condition.
+
+Offline logic tests cover this adaptation, and it **has** now been verified on real macOS
+hardware: [exact-head report on PR #13](https://github.com/microsoft/amplifier-bundle-computer-use/pull/13#issuecomment-5688667363).
+That run drove **macOS 26.6.2 (25G83)** with a **single active 5120x1440 display**, over the
+SSH production path (`registry.select_backend({"target": "ssh://..."}) -> RemoteBackend
+.connect() -> capture_scaled()`), and exercised **both full-screen and region capture**; no
+guard refused spuriously across four consecutive runs. On that machine the native
+`CGDisplayCreateImage` returned `None` in ~5.0s and `screencapture` completed in ~0.23s.
+
+What that run does **not** establish, stated so it is not inferred: nothing about multiple
+active displays (out of scope here - see PR #11), three or more displays, non-top-aligned
+arrangements, or whether `-m` still follows the main display when main is not the first
+active display. A positive preflight still does not establish that the utility has the same
+TCC attribution, and the topology and permission checks remain non-atomic regardless of this
+result. The capture-alternative lead was reported by
+[@colombod in PR #11](https://github.com/microsoft/amplifier-bundle-computer-use/pull/11).
+
+---
+
 ## 9. Known issues
 
 ### macOS `type_text` silently no-ops while returning success — OPEN
