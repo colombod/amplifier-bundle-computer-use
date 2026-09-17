@@ -1569,7 +1569,7 @@ class MacOSBackend:
             elif display_id is not None and int(m.id) in ids:
                 # Per-display form of the same guarded fallback. Without this, a Mac
                 # with a second display attached cannot take ANY per-monitor capture
-                # on macOS 26 - and per-monitor IS the default (`target_monitor`
+                # on macOS 26.6.2 - and per-monitor IS the default (`target_monitor`
                 # defaults to "primary", which routes here, not through the
                 # whole-virtual-desktop branch above). Measured: attaching one more
                 # display turned every screenshot into

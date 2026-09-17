@@ -724,7 +724,7 @@ The multi-display paths were verified on the same machine with a second display 
 genuinely mixed-DPI pair — a 2x built-in (1728x1117 points at the origin) beside the 1x
 5120x1440 ultrawide. Whole-desktop capture returned the same 13696x2880 canvas as
 `CGWindowListCreateImage` in 0.47s against its 30.04s, and region capture — which fails
-outright on macOS 26 without the per-display form — returned an exact 800x600 crop.
+outright on macOS 26.6.2 without the per-display form — returned an exact 800x600 crop.
 
 **Not** covered by any of those runs, stated so it is not inferred: three or more displays,
 non-top-aligned display arrangements, and whether `-m` still follows the main display when
